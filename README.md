@@ -868,3 +868,7 @@ Important files:
 - Google Tag Manager API: https://developers.google.com/tag-platform/tag-manager/api/v2
 - Search Ads 360 Reporting API: https://developers.google.com/search-ads/reporting/api/reference/rest
 - Legacy Search Ads 360 API: https://developers.google.com/search-ads/v2
+
+## License
+
+Released under the [MIT License](LICENSE). The software is provided "as is", without warranty of any kind. You are responsible for how you use it against your own Google Marketing Platform accounts, including all write operations.

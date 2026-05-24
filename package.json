@@ -2,6 +2,12 @@
   "name": "gmp-mcp",
   "version": "0.1.0",
   "description": "Write-capable Model Context Protocol server for Google Marketing Platform.",
+  "author": "REllwood",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/REllwood/GMP-MCP.git"
+  },
   "type": "module",
   "bin": {
     "gmp-mcp": "./dist/index.js"
