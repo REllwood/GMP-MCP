@@ -4,7 +4,12 @@ import type { HttpMethod, QueryParams } from "./cm360Client.js";
 import type { GmpProduct, ServerConfig } from "./config.js";
 import type { GoogleApiClient } from "./googleApiClient.js";
 import { errorResult, jsonResult } from "./response.js";
-import { assertRawRequestAllowedEntities, auditMutation, guardMutation, rawRequestEnabled } from "./safety.js";
+import {
+  assertRawRequestAllowedEntities,
+  auditLiveCompletion,
+  guardMutation,
+  rawRequestEnabled
+} from "./safety.js";
 
 export interface GuardedRequestArgs {
   client: GoogleApiClient;
@@ -60,7 +65,7 @@ export async function runGuardedGoogleRequest(args: GuardedRequestArgs): Promise
     }
 
     const result = await args.client.request(args.request);
-    await auditMutation(args.config, {
+    const warning = await auditLiveCompletion(args.config, {
       product: args.product,
       toolName: args.toolName,
       profileId: args.profileId,
@@ -76,9 +81,9 @@ export async function runGuardedGoogleRequest(args: GuardedRequestArgs): Promise
       gtmContainerId: args.gtmContainerId,
       sa360CustomerId: args.sa360CustomerId,
       request: args.request
-    }, "live_completed");
+    });
 
-    return jsonResult(result);
+    return jsonResult(warning ? { result, warning } : result);
   });
 }
 

@@ -5,7 +5,7 @@ import type { ServerConfig } from "./config.js";
 import type { GoogleApiClient } from "./googleApiClient.js";
 import { jsonResult } from "./response.js";
 import { confirmSchema, dryRunSchema, idString, jsonObject, mutationControls, querySchema } from "./schemas.js";
-import { assertAllowedEntities, assertBroadListAllowed } from "./safety.js";
+import { assertAllowedEntities, assertBroadListAllowed, SafetyError } from "./safety.js";
 import { runGuardedGoogleRequest, runRawGoogleRequest, safeRun } from "./toolHelpers.js";
 
 interface Ga4ToolContext {
@@ -71,12 +71,13 @@ function registerGa4ReadTools(server: McpServer, { adminClient, adminAlphaClient
       description: "List GA4 properties. Pass filter such as parent:accounts/123 when needed.",
       inputSchema: z.object({
         accountId: idString.optional(),
-        filter: z.string().optional(),
+        filter: z.string().trim().min(1).optional(),
         query: querySchema
       })
     },
     async ({ accountId, filter, query }) =>
       safeRun(async () => {
+        const resolvedFilter = ga4PropertyFilter(accountId, filter);
         assertAllowedEntities(config, { product: "ga4", toolName: "ga4_list_properties", ga4AccountId: accountId, request: { method: "GET", path: "/properties" } });
         if (!accountId) {
           assertBroadListAllowed("GA4 property", config.allowedGa4AccountIds);
@@ -88,7 +89,7 @@ function registerGa4ReadTools(server: McpServer, { adminClient, adminAlphaClient
             path: "/properties",
             query: {
               ...query,
-              filter: filter ?? (accountId ? `parent:accounts/${accountId}` : undefined)
+              filter: resolvedFilter
             }
           })
         );
@@ -145,7 +146,8 @@ function registerGa4ReadTools(server: McpServer, { adminClient, adminAlphaClient
     getTool: "ga4_get_conversion_event",
     resource: "conversionEvents",
     idName: "conversionEventId",
-    singular: "conversion event"
+    singular: "conversion event",
+    deprecatedAlternative: "Use GA4 key event tools for new integrations."
   });
 
   registerPropertyResource(server, { adminClient: adminAlphaClient, config }, {
@@ -285,7 +287,8 @@ function registerGa4WriteTools(server: McpServer, { adminClient, adminAlphaClien
     patchTool: "ga4_patch_conversion_event",
     resource: "conversionEvents",
     bodyName: "conversionEvent",
-    idName: "conversionEventId"
+    idName: "conversionEventId",
+    deprecatedAlternative: "Use GA4 key event tools for new integrations."
   });
 
   registerPropertyCreatePatch(server, { adminClient: adminAlphaClient, config }, {
@@ -385,6 +388,31 @@ function registerGa4RawTools(server: McpServer, { adminClient, dataClient, confi
   );
 }
 
+function ga4PropertyFilter(
+  accountId: string | undefined,
+  filter: string | undefined
+): string {
+  if (!accountId && !filter) {
+    throw new SafetyError("ga4_list_properties requires accountId or an explicit filter.");
+  }
+
+  if (!accountId) {
+    return filter as string;
+  }
+
+  const allowedFilters = new Set([
+    `parent:accounts/${accountId}`,
+    `ancestor:accounts/${accountId}`
+  ]);
+  if (filter && !allowedFilters.has(filter)) {
+    throw new SafetyError(
+      `GA4 property filter must target the declared account ${accountId}.`
+    );
+  }
+
+  return filter ?? `parent:accounts/${accountId}`;
+}
+
 function registerPropertyResource(
   server: McpServer,
   { adminClient, config }: { adminClient: GoogleApiClient; config: ServerConfig },
@@ -394,12 +422,13 @@ function registerPropertyResource(
     resource: string;
     idName: string;
     singular: string;
+    deprecatedAlternative?: string;
   }
 ): void {
   server.registerTool(
     options.listTool,
     {
-      description: `List GA4 ${options.singular}s for a property.`,
+      description: `List GA4 ${options.singular}s for a property.${deprecatedGuidance(options.deprecatedAlternative)}`,
       inputSchema: z.object({
         propertyId: idString,
         query: querySchema
@@ -415,7 +444,7 @@ function registerPropertyResource(
   server.registerTool(
     options.getTool,
     {
-      description: `Get one GA4 ${options.singular}.`,
+      description: `Get one GA4 ${options.singular}.${deprecatedGuidance(options.deprecatedAlternative)}`,
       inputSchema: z.object({
         propertyId: idString,
         [options.idName]: idString
@@ -442,12 +471,13 @@ function registerPropertyCreatePatch(
     resource: string;
     bodyName: string;
     idName: string;
+    deprecatedAlternative?: string;
   }
 ): void {
   server.registerTool(
     options.createTool,
     {
-      description: `Create a GA4 ${options.bodyName}.`,
+      description: `Create a GA4 ${options.bodyName}.${deprecatedGuidance(options.deprecatedAlternative)}`,
       inputSchema: z.object({
         propertyId: idString,
         resource: jsonObject,
@@ -474,7 +504,7 @@ function registerPropertyCreatePatch(
   server.registerTool(
     options.patchTool,
     {
-      description: `Patch selected fields on a GA4 ${options.bodyName}.`,
+      description: `Patch selected fields on a GA4 ${options.bodyName}.${deprecatedGuidance(options.deprecatedAlternative)}`,
       inputSchema: z.object({
         propertyId: idString,
         [options.idName]: idString,
@@ -504,4 +534,8 @@ function registerPropertyCreatePatch(
       });
     }
   );
+}
+
+function deprecatedGuidance(alternative: string | undefined): string {
+  return alternative ? ` Deprecated Google API compatibility only. ${alternative}` : "";
 }

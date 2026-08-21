@@ -6,6 +6,7 @@ import {
   assertEntityAllowed,
   assertEntityIdsAllowed,
   assertRawRequestAllowedEntities,
+  guardMutation,
   rawRequestEnabled,
   redactForAudit,
   SafetyError,
@@ -51,9 +52,9 @@ describe("product safety", () => {
     ).toThrow(SafetyError);
   });
 
-  it("requires raw request metadata when an allowlist is configured", () => {
+  it("derives raw request targets from the path and rejects false metadata", () => {
     const config = testConfig({
-      allowedGa4PropertyIds: new Set(["properties/123"])
+      allowedGa4PropertyIds: new Set(["123"])
     });
 
     expect(() =>
@@ -62,16 +63,34 @@ describe("product safety", () => {
         toolName: "ga4_api_request",
         request: { method: "GET", path: "/properties/123/dataStreams" }
       })
-    ).toThrow(SafetyError);
+    ).not.toThrow();
 
     expect(() =>
       assertRawRequestAllowedEntities(config, {
         product: "ga4",
         toolName: "ga4_api_request",
-        ga4PropertyId: "properties/123",
+        ga4PropertyId: "123",
         request: { method: "GET", path: "/properties/123/dataStreams" }
       })
     ).not.toThrow();
+
+    expect(() =>
+      assertRawRequestAllowedEntities(config, {
+        product: "ga4",
+        toolName: "ga4_api_request",
+        ga4PropertyId: "123",
+        request: { method: "GET", path: "/properties/456/dataStreams" }
+      })
+    ).toThrow(/does not match/);
+
+    expect(() =>
+      assertRawRequestAllowedEntities(config, {
+        product: "ga4",
+        toolName: "ga4_api_request",
+        ga4PropertyId: "123",
+        request: { method: "GET", path: "/accountSummaries" }
+      })
+    ).toThrow(/cannot be verified/);
   });
 
   it("requires bulk IDs when a bulk allowlist is configured", () => {
@@ -112,6 +131,78 @@ describe("product safety", () => {
     expect(writesEnabled(config, "ga4")).toBe(false);
     expect(rawRequestEnabled(config, "ga4")).toBe(true);
     expect(rawRequestEnabled(config, "gtm")).toBe(false);
+  });
+});
+
+describe("mutation previews", () => {
+  it("requires an exact prior preview and consumes it after one live request", async () => {
+    const config = testConfig({
+      productWritesEnabled: {
+        cm360: true,
+        dv360: false,
+        bidManager: false,
+        ga4: false,
+        gtm: false,
+        sa360: false
+      }
+    });
+    const input = {
+      toolName: "test_exact_preview",
+      profileId: "1",
+      request: {
+        method: "POST" as const,
+        path: "/userprofiles/1/campaigns",
+        body: { name: "Reviewed campaign", advertiserId: "2" }
+      }
+    };
+
+    await expect(
+      guardMutation(config, { ...input, dryRun: false, confirm: true })
+    ).rejects.toThrow(/Preview this exact request/);
+
+    const preview = await guardMutation(config, { ...input, dryRun: true });
+    expect(preview.preview?.expiresAt).toBeTruthy();
+
+    await expect(
+      guardMutation(config, { ...input, dryRun: false, confirm: true })
+    ).resolves.toEqual({ dryRun: false });
+
+    await expect(
+      guardMutation(config, { ...input, dryRun: false, confirm: true })
+    ).rejects.toThrow(/Preview this exact request/);
+  });
+
+  it("rejects a live payload that differs from the reviewed preview", async () => {
+    const config = testConfig({
+      productWritesEnabled: {
+        cm360: true,
+        dv360: false,
+        bidManager: false,
+        ga4: false,
+        gtm: false,
+        sa360: false
+      }
+    });
+    const baseInput = {
+      toolName: "test_changed_preview",
+      profileId: "1",
+      request: {
+        method: "PATCH" as const,
+        path: "/userprofiles/1/campaigns",
+        query: { id: "2" },
+        body: { name: "Reviewed name" }
+      }
+    };
+
+    await guardMutation(config, { ...baseInput, dryRun: true });
+    await expect(
+      guardMutation(config, {
+        ...baseInput,
+        dryRun: false,
+        confirm: true,
+        request: { ...baseInput.request, body: { name: "Different name" } }
+      })
+    ).rejects.toThrow(/Preview this exact request/);
   });
 });
 

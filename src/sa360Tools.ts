@@ -90,7 +90,12 @@ function registerSa360ReportingTools(server: McpServer, { reportingClient, confi
     {
       description: "Get one Search Ads 360 reporting field metadata record.",
       inputSchema: z.object({
-        resourceName: z.string().min(1).describe("For example searchAds360Fields/campaign.name.")
+        resourceName: z
+          .string()
+          .regex(
+            /^searchAds360Fields\/[A-Za-z0-9_.-]+$/,
+            "Use a Search Ads 360 field resource name such as searchAds360Fields/campaign.name."
+          )
       })
     },
     async ({ resourceName }) =>

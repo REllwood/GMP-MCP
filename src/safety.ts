@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { appendFile, mkdir } from "node:fs/promises";
 import path from "node:path";
 
@@ -36,6 +37,7 @@ export interface MutationGuardResult {
   preview?: {
     status: "dry_run";
     message: string;
+    expiresAt: string;
     request: MutationRequestPreview;
   };
 }
@@ -51,6 +53,9 @@ const redacted = "[redacted]";
 const circularReference = "[circular]";
 const maxAuditStringLength = 2048;
 const maxAuditDepth = 8;
+const previewTtlMs = 15 * 60 * 1000;
+const maxPendingPreviews = 1_000;
+const pendingPreviews = new Map<string, number>();
 const sensitiveAuditKeyPattern =
   /(authori[sz]ation|cookie|token|secret|password|private.?key|client.?secret|refresh|email|phone|user.?id|user.?identifier|mobile.?device|gclid|dclid|gbraid|wbraid|match.?id|ip.?address)/i;
 
@@ -62,14 +67,18 @@ export async function guardMutation(
   assertAllowedEntities(config, input);
 
   const dryRun = input.dryRun ?? true;
+  const previewFingerprint = mutationFingerprint(product, input.toolName, input.request);
 
   if (dryRun) {
     await auditMutation(config, input, "dry_run");
+    const expiresAt = Date.now() + previewTtlMs;
+    rememberPreview(previewFingerprint, expiresAt);
     return {
       dryRun: true,
       preview: {
         status: "dry_run",
-        message: `No ${product.toUpperCase()} change was made. Re-run with dryRun=false and confirm=true to execute.`,
+        message: `No ${product.toUpperCase()} change was made. Re-run this exact request with dryRun=false and confirm=true before the preview expires.`,
+        expiresAt: new Date(expiresAt).toISOString(),
         request: input.request
       }
     };
@@ -85,8 +94,76 @@ export async function guardMutation(
     throw new SafetyError("Live write blocked. Re-run with confirm=true after reviewing the payload.");
   }
 
+  consumePreview(previewFingerprint);
   await auditMutation(config, input, "live_requested");
   return { dryRun: false };
+}
+
+function mutationFingerprint(
+  product: GmpProduct,
+  toolName: string,
+  request: MutationRequestPreview
+): string {
+  return createHash("sha256")
+    .update(stableStringify({ product, toolName, request }))
+    .digest("hex");
+}
+
+function stableStringify(value: unknown): string {
+  return JSON.stringify(sortForFingerprint(value));
+}
+
+function sortForFingerprint(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => sortForFingerprint(item));
+  }
+
+  if (value === null || typeof value !== "object") {
+    return value;
+  }
+
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .filter(([, nestedValue]) => nestedValue !== undefined)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, nestedValue]) => [key, sortForFingerprint(nestedValue)])
+  );
+}
+
+function rememberPreview(fingerprint: string, expiresAt: number): void {
+  pruneExpiredPreviews(Date.now());
+  pendingPreviews.delete(fingerprint);
+  pendingPreviews.set(fingerprint, expiresAt);
+
+  while (pendingPreviews.size > maxPendingPreviews) {
+    const oldest = pendingPreviews.keys().next().value as string | undefined;
+    if (!oldest) {
+      break;
+    }
+    pendingPreviews.delete(oldest);
+  }
+}
+
+function consumePreview(fingerprint: string): void {
+  const now = Date.now();
+  pruneExpiredPreviews(now);
+  const expiresAt = pendingPreviews.get(fingerprint);
+
+  if (!expiresAt || expiresAt <= now) {
+    throw new SafetyError(
+      "Live write blocked. Preview this exact request with dryRun=true before confirming it."
+    );
+  }
+
+  pendingPreviews.delete(fingerprint);
+}
+
+function pruneExpiredPreviews(now: number): void {
+  for (const [fingerprint, expiresAt] of pendingPreviews) {
+    if (expiresAt <= now) {
+      pendingPreviews.delete(fingerprint);
+    }
+  }
 }
 
 export function assertEntityAllowed(
@@ -185,63 +262,122 @@ export function assertAllowedEntities(config: ServerConfig, input: MutationGuard
 
 export function assertRawRequestAllowedEntities(config: ServerConfig, input: MutationGuardInput): void {
   const product = input.product ?? "cm360";
+  const path = rawRequestPath(input.request.path);
 
   if (product === "cm360") {
-    assertRawEntityAllowed("profile", input.profileId, config.allowedProfileIds);
-    assertRawEntityAllowed("advertiser", input.advertiserId, config.allowedAdvertiserIds);
-    assertRawEntityAllowed("campaign", input.campaignId, config.allowedCampaignIds);
+    assertRawPathEntityAllowed("profile", input.profileId, config.allowedProfileIds, path, ["userprofiles"], input.request.query);
+    assertRawPathEntityAllowed("advertiser", input.advertiserId, config.allowedAdvertiserIds, path, ["advertisers"], input.request.query);
+    assertRawPathEntityAllowed("campaign", input.campaignId, config.allowedCampaignIds, path, ["campaigns"], input.request.query);
     return;
   }
 
   if (product === "dv360" || product === "bidManager") {
-    assertRawEntityAllowed("DV360 partner", input.partnerId, config.allowedDv360PartnerIds);
-    assertRawEntityAllowed("DV360 advertiser", input.advertiserId, config.allowedDv360AdvertiserIds);
-    assertRawEntityAllowed("DV360 campaign", input.campaignId, config.allowedDv360CampaignIds);
-    assertRawEntityAllowed(
+    assertRawPathEntityAllowed("DV360 partner", input.partnerId, config.allowedDv360PartnerIds, path, ["partners"], input.request.query);
+    assertRawPathEntityAllowed("DV360 advertiser", input.advertiserId, config.allowedDv360AdvertiserIds, path, ["advertisers"], input.request.query);
+    assertRawPathEntityAllowed("DV360 campaign", input.campaignId, config.allowedDv360CampaignIds, path, ["campaigns"], input.request.query);
+    assertRawPathEntityAllowed(
       "DV360 insertion order",
       input.insertionOrderId,
-      config.allowedDv360InsertionOrderIds
+      config.allowedDv360InsertionOrderIds,
+      path,
+      ["insertionOrders"],
+      input.request.query
     );
-    assertRawEntityAllowed("DV360 line item", input.lineItemId, config.allowedDv360LineItemIds);
+    assertRawPathEntityAllowed("DV360 line item", input.lineItemId, config.allowedDv360LineItemIds, path, ["lineItems"], input.request.query);
     if (product === "bidManager") {
-      assertRawEntityAllowed("Bid Manager query", input.bidManagerQueryId, config.allowedBidManagerQueryIds);
+      assertRawPathEntityAllowed("Bid Manager query", input.bidManagerQueryId, config.allowedBidManagerQueryIds, path, ["queries"], input.request.query);
     }
     return;
   }
 
   if (product === "ga4") {
-    assertRawEntityAllowed("GA4 account", input.ga4AccountId, config.allowedGa4AccountIds);
-    assertRawEntityAllowed("GA4 property", input.ga4PropertyId, config.allowedGa4PropertyIds);
+    assertRawPathEntityAllowed("GA4 account", input.ga4AccountId, config.allowedGa4AccountIds, path, ["accounts"], input.request.query);
+    assertRawPathEntityAllowed("GA4 property", input.ga4PropertyId, config.allowedGa4PropertyIds, path, ["properties"], input.request.query);
     return;
   }
 
   if (product === "gtm") {
-    assertRawEntityAllowed("GTM account", input.gtmAccountId, config.allowedGtmAccountIds);
-    assertRawEntityAllowed("GTM container", input.gtmContainerId, config.allowedGtmContainerIds);
+    assertRawPathEntityAllowed("GTM account", input.gtmAccountId, config.allowedGtmAccountIds, path, ["accounts"], input.request.query);
+    assertRawPathEntityAllowed("GTM container", input.gtmContainerId, config.allowedGtmContainerIds, path, ["containers"], input.request.query);
     return;
   }
 
   if (product === "sa360") {
-    assertRawEntityAllowed("SA360 customer", input.sa360CustomerId, config.allowedSa360CustomerIds);
+    assertRawPathEntityAllowed("SA360 customer", input.sa360CustomerId, config.allowedSa360CustomerIds, path, ["customers"], input.request.query);
   }
 }
 
-function assertRawEntityAllowed(
+function assertRawPathEntityAllowed(
   entityName: string,
-  id: string | undefined,
-  allowlist: Set<string>
+  declaredId: string | undefined,
+  allowlist: Set<string>,
+  requestPath: string,
+  resourceNames: readonly string[],
+  query: QueryParams | undefined
 ): void {
+  const targetIds = extractPathEntityIds(requestPath, resourceNames, query);
+
+  if (declaredId && targetIds.size > 0 && !targetIds.has(declaredId)) {
+    throw new SafetyError(
+      `${entityName} metadata ${declaredId} does not match the target encoded in the raw request path.`
+    );
+  }
+
   if (allowlist.size === 0) {
     return;
   }
 
-  if (!id) {
+  if (targetIds.size === 0) {
     throw new SafetyError(
-      `${entityName} ID must be supplied to use a raw request tool when that allowlist is configured.`
+      `${entityName} allowlist cannot be verified from this raw request path. Use a first-class tool or disable the raw request.`
     );
   }
 
-  assertEntityAllowed(entityName, id, allowlist);
+  for (const targetId of targetIds) {
+    assertEntityAllowed(entityName, targetId, allowlist);
+  }
+}
+
+function rawRequestPath(requestPath: string): string {
+  try {
+    return new URL(requestPath, "https://mcp.invalid").pathname;
+  } catch {
+    throw new SafetyError("Raw request path must be a valid API path.");
+  }
+}
+
+function extractPathEntityIds(
+  requestPath: string,
+  resourceNames: readonly string[],
+  query: QueryParams | undefined
+): Set<string> {
+  const ids = new Set<string>();
+  const segments = requestPath.split("/").filter(Boolean);
+
+  for (let index = 0; index < segments.length; index += 1) {
+    const resourceSegment = segments[index]?.split(":", 1)[0];
+    if (!resourceSegment || !resourceNames.includes(resourceSegment)) {
+      continue;
+    }
+
+    const rawId = segments[index + 1];
+    if (rawId) {
+      const id = rawId.split(":", 1)[0];
+      if (id) {
+        ids.add(id);
+      }
+      continue;
+    }
+
+    const queryIds = query?.id;
+    for (const queryId of Array.isArray(queryIds) ? queryIds : [queryIds]) {
+      if (typeof queryId === "string" || typeof queryId === "number") {
+        ids.add(String(queryId));
+      }
+    }
+  }
+
+  return ids;
 }
 
 export function writesEnabled(config: ServerConfig, product: GmpProduct): boolean {
@@ -279,6 +415,22 @@ export async function auditMutation(
 
   await mkdir(path.dirname(config.auditLogPath), { recursive: true });
   await appendFile(config.auditLogPath, `${line}\n`, "utf8");
+}
+
+export async function auditLiveCompletion(
+  config: ServerConfig,
+  input: MutationGuardInput
+): Promise<{ code: "audit_log_failed"; message: string } | undefined> {
+  try {
+    await auditMutation(config, input, "live_completed");
+    return undefined;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    return {
+      code: "audit_log_failed",
+      message: `The Google request succeeded, but the local completion audit record could not be written: ${detail}`
+    };
+  }
 }
 
 export function redactForAudit(value: unknown): unknown {

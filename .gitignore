@@ -1,0 +1,15 @@
+node_modules/
+dist/
+.DS_Store
+.env
+.cm360-mcp/
+.gmp-mcp/
+coverage/
+*.tgz
+*.log
+
+# Local agent/editor scratch — never ship
+.claude/
+.forge/
+.agents/
+.planning/

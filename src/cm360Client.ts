@@ -3,6 +3,7 @@ import path from "node:path";
 
 import { getAccessToken, type AccessTokenProvider } from "./auth.js";
 import type { ServerConfig } from "./config.js";
+import { readResponseBytes } from "./http.js";
 
 export type HttpMethod = "GET" | "POST" | "PATCH" | "PUT" | "DELETE";
 
@@ -42,6 +43,7 @@ export interface DownloadedReportFile {
 }
 
 const retryableStatuses = new Set([429, 500, 502, 503, 504]);
+const retryableMethods = new Set<HttpMethod>(["GET", "PUT", "DELETE"]);
 const maxErrorPreviewBytes = 65_536;
 
 export class Cm360Client {
@@ -79,7 +81,11 @@ export class Cm360Client {
         return this.parseResponse<T>(response, options.responseType);
       }
 
-      if (!retryableStatuses.has(response.status) || attempt === this.config.maxRetries) {
+      if (
+        !retryableMethods.has(options.method) ||
+        !retryableStatuses.has(response.status) ||
+        attempt === this.config.maxRetries
+      ) {
         const responseBody = await safeReadResponseText(response);
         throw new Cm360ApiError(
           `CM360 API request failed with HTTP ${response.status}.`,
@@ -188,20 +194,7 @@ export class Cm360Client {
   }
 
   private async readBytes(response: Response): Promise<ArrayBuffer> {
-    const contentLength = response.headers.get("content-length");
-    if (contentLength) {
-      const sizeBytes = Number(contentLength);
-      if (Number.isFinite(sizeBytes) && sizeBytes > this.config.maxDownloadBytes) {
-        throw new Error(`CM360 download content-length exceeded GMP_MAX_DOWNLOAD_BYTES (${this.config.maxDownloadBytes}).`);
-      }
-    }
-
-    const bytes = await response.arrayBuffer();
-    if (bytes.byteLength > this.config.maxDownloadBytes) {
-      throw new Error(`CM360 download exceeded GMP_MAX_DOWNLOAD_BYTES (${this.config.maxDownloadBytes}).`);
-    }
-
-    return bytes;
+    return readResponseBytes(response, this.config.maxDownloadBytes, "CM360");
   }
 }
 

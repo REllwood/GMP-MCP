@@ -1,6 +1,18 @@
 import * as z from "zod/v4";
 
-export const idString = z.string().min(1).describe("Google Marketing Platform ID as a string.");
+export const apiPathSegment = z
+  .string()
+  .trim()
+  .min(1)
+  .max(256)
+  .regex(
+    /^[A-Za-z0-9][A-Za-z0-9._-]*$/,
+    "IDs may contain only letters, numbers, dots, underscores and hyphens."
+  );
+
+export const idString = apiPathSegment.describe(
+  "Google Marketing Platform ID as a single safe URL path segment."
+);
 
 export const jsonObject = z
   .record(z.string(), z.unknown())

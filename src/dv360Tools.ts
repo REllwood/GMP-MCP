@@ -5,7 +5,15 @@ import type { HttpMethod } from "./cm360Client.js";
 import type { ServerConfig } from "./config.js";
 import type { GoogleApiClient } from "./googleApiClient.js";
 import { jsonResult } from "./response.js";
-import { confirmSchema, dryRunSchema, idString, jsonObject, mutationControls, querySchema } from "./schemas.js";
+import {
+  apiPathSegment,
+  confirmSchema,
+  dryRunSchema,
+  idString,
+  jsonObject,
+  mutationControls,
+  querySchema
+} from "./schemas.js";
 import {
   assertAllowedEntities,
   assertBroadListAllowed,
@@ -129,7 +137,7 @@ function registerDv360ReadTools(server: McpServer, { dv360Client, config }: Dv36
     {
       description: "List targetable DV360 options for a targeting type.",
       inputSchema: z.object({
-        targetingType: z.string().min(1),
+        targetingType: apiPathSegment,
         query: querySchema
       })
     },
@@ -148,26 +156,22 @@ function registerDv360ReadTools(server: McpServer, { dv360Client, config }: Dv36
   server.registerTool(
     "dv360_list_assigned_targeting_options",
     {
-      description: "List assigned DV360 targeting options at advertiser, campaign, insertion order or line item level.",
+      description: "List assigned DV360 targeting options at advertiser or line item level.",
       inputSchema: z.object({
         advertiserId: idString,
-        targetingType: z.string().min(1).optional(),
-        level: z.enum(["advertiser", "campaign", "insertionOrder", "lineItem"]),
-        campaignId: idString.optional(),
-        insertionOrderId: idString.optional(),
+        targetingType: apiPathSegment.optional(),
+        level: z.enum(["advertiser", "lineItem"]),
         lineItemId: idString.optional(),
         query: querySchema
       })
     },
-    async ({ advertiserId, targetingType, level, campaignId, insertionOrderId, lineItemId, query }) =>
+    async ({ advertiserId, targetingType, level, lineItemId, query }) =>
       safeRun(async () => {
-        const path = assignedTargetingListPath({ advertiserId, targetingType, level, campaignId, insertionOrderId, lineItemId });
+        const path = assignedTargetingListPath({ advertiserId, targetingType, level, lineItemId });
         assertAllowedEntities(config, {
           product: "dv360",
           toolName: "dv360_list_assigned_targeting_options",
           advertiserId,
-          campaignId,
-          insertionOrderId,
           lineItemId,
           request: { method: "GET", path }
         });
@@ -315,31 +319,29 @@ function registerDv360WriteTools(server: McpServer, { dv360Client, config }: Dv3
   server.registerTool(
     "dv360_assign_targeting_option",
     {
-      description: "Assign a DV360 targeting option at insertion order or line item level.",
+      description: "Assign a DV360 targeting option at line item level.",
       inputSchema: z.object({
         advertiserId: idString,
-        targetingType: z.string().min(1),
-        level: z.enum(["insertionOrder", "lineItem"]),
+        targetingType: apiPathSegment,
+        level: z.literal("lineItem").optional().default("lineItem"),
         assignedTargetingOption: jsonObject,
-        insertionOrderId: idString.optional(),
-        lineItemId: idString.optional(),
+        lineItemId: idString,
         ...mutationControls
       })
     },
-    async ({ advertiserId, targetingType, level, assignedTargetingOption, insertionOrderId, lineItemId, dryRun, confirm }) =>
+    async ({ advertiserId, targetingType, assignedTargetingOption, lineItemId, dryRun, confirm }) =>
       runGuardedGoogleRequest({
         client: dv360Client,
         config,
         product: "dv360",
         toolName: "dv360_assign_targeting_option",
         advertiserId,
-        insertionOrderId,
         lineItemId,
         dryRun,
         confirm,
         request: {
           method: "POST",
-          path: assignedTargetingPath({ advertiserId, targetingType, level, insertionOrderId, lineItemId }),
+          path: assignedTargetingPath({ advertiserId, targetingType, lineItemId }),
           body: assignedTargetingOption
         }
       })
@@ -696,22 +698,25 @@ function registerCreateAndPatch(
       })
     },
     async ({ advertiserId, resource, dryRun, confirm }) =>
-      runGuardedGoogleRequest({
-        client: dv360Client,
-        config,
-        product: "dv360",
-        toolName: options.createTool,
-        advertiserId,
-        campaignId: stringField(resource, "campaignId"),
-        insertionOrderId: stringField(resource, "insertionOrderId"),
-        lineItemId: stringField(resource, "lineItemId"),
-        dryRun,
-        confirm,
-        request: {
-          method: "POST",
-          path: `/advertisers/${advertiserId}/${options.resource}`,
-          body: resource
-        }
+      safeRun(async () => {
+        assertDv360CreateAllowed(config, options.idAllowlistName, options.bodyName);
+        return runGuardedGoogleRequest({
+          client: dv360Client,
+          config,
+          product: "dv360",
+          toolName: options.createTool,
+          advertiserId,
+          campaignId: stringField(resource, "campaignId"),
+          insertionOrderId: stringField(resource, "insertionOrderId"),
+          lineItemId: stringField(resource, "lineItemId"),
+          dryRun,
+          confirm,
+          request: {
+            method: "POST",
+            path: `/advertisers/${advertiserId}/${options.resource}`,
+            body: resource
+          }
+        });
       })
   );
 
@@ -775,29 +780,17 @@ function allowlistEntity(idName: "campaignId" | "insertionOrderId" | "lineItemId
 function assignedTargetingPath(args: {
   advertiserId: string;
   targetingType: string;
-  level: "insertionOrder" | "lineItem";
-  campaignId?: string;
-  insertionOrderId?: string;
-  lineItemId?: string;
+  lineItemId: string;
 }): string {
   const base = `/advertisers/${args.advertiserId}`;
   const suffix = `/targetingTypes/${args.targetingType}/assignedTargetingOptions`;
-
-  if (args.level === "insertionOrder") {
-    assertRequiredId("insertionOrderId", args.insertionOrderId);
-    return `${base}/insertionOrders/${args.insertionOrderId}${suffix}`;
-  }
-
-  assertRequiredId("lineItemId", args.lineItemId);
   return `${base}/lineItems/${args.lineItemId}${suffix}`;
 }
 
 function assignedTargetingListPath(args: {
   advertiserId: string;
   targetingType?: string;
-  level: "advertiser" | "campaign" | "insertionOrder" | "lineItem";
-  campaignId?: string;
-  insertionOrderId?: string;
+  level: "advertiser" | "lineItem";
   lineItemId?: string;
 }): string {
   const base = `/advertisers/${args.advertiserId}`;
@@ -806,21 +799,8 @@ function assignedTargetingListPath(args: {
     return `${base}:listAssignedTargetingOptions`;
   }
 
-  if (args.level === "campaign") {
-    assertRequiredId("campaignId", args.campaignId);
-    if (!args.targetingType) {
-      return `${base}/campaigns/${args.campaignId}:listAssignedTargetingOptions`;
-    }
-    return `${base}/campaigns/${args.campaignId}/targetingTypes/${args.targetingType}/assignedTargetingOptions`;
-  }
-
   if (!args.targetingType) {
-    throw new Error("targetingType is required for insertion order and line item targeting lists.");
-  }
-
-  if (args.level === "insertionOrder") {
-    assertRequiredId("insertionOrderId", args.insertionOrderId);
-    return `${base}/insertionOrders/${args.insertionOrderId}/targetingTypes/${args.targetingType}/assignedTargetingOptions`;
+    throw new Error("targetingType is required for line item targeting lists.");
   }
 
   assertRequiredId("lineItemId", args.lineItemId);
@@ -850,6 +830,26 @@ function assertDv360BroadResourceListAllowed(
 
   if (idAllowlistName === "lineItemId") {
     assertBroadListAllowed(`DV360 ${singular}`, config.allowedDv360LineItemIds);
+  }
+}
+
+function assertDv360CreateAllowed(
+  config: ServerConfig,
+  idAllowlistName: "campaignId" | "insertionOrderId" | "lineItemId" | undefined,
+  resourceName: string
+): void {
+  const allowlist = idAllowlistName === "campaignId"
+    ? config.allowedDv360CampaignIds
+    : idAllowlistName === "insertionOrderId"
+      ? config.allowedDv360InsertionOrderIds
+      : idAllowlistName === "lineItemId"
+        ? config.allowedDv360LineItemIds
+        : new Set<string>();
+
+  if (allowlist.size > 0) {
+    throw new Error(
+      `Creating a new DV360 ${resourceName} is blocked while its ID allowlist is configured because the new ID is not known in advance.`
+    );
   }
 }
 

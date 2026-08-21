@@ -96,6 +96,22 @@ function parseNumber(value: string | undefined, fallback: number): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+function parseNonNegativeInteger(
+  value: string | undefined,
+  fallback: number,
+  maximum: number
+): number {
+  if (value === undefined) {
+    return fallback;
+  }
+
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0 || parsed > maximum) {
+    return fallback;
+  }
+  return parsed;
+}
+
 function parseCsvSet(value: string | undefined): Set<string> {
   if (!value) {
     return new Set();
@@ -294,7 +310,11 @@ export function loadConfig(): ServerConfig {
       ".gmp-mcp/downloads"
     ),
     requestsPerSecond: parseNumber(envValue("GMP_REQUESTS_PER_SECOND") ?? envValue("CM360_REQUESTS_PER_SECOND"), 1),
-    maxRetries: Math.floor(parseNumber(envValue("GMP_MAX_RETRIES") ?? envValue("CM360_MAX_RETRIES"), 3)),
+    maxRetries: parseNonNegativeInteger(
+      envValue("GMP_MAX_RETRIES") ?? envValue("CM360_MAX_RETRIES"),
+      3,
+      10
+    ),
     requestTimeoutMs: Math.floor(
       parseNumber(envValue("GMP_REQUEST_TIMEOUT_MS") ?? envValue("CM360_REQUEST_TIMEOUT_MS"), 60_000)
     ),

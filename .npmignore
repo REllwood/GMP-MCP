@@ -1,0 +1,7 @@
+.DS_Store
+dist/**/*.test.d.ts
+dist/**/*.test.js
+dist/**/*.test.js.map
+src/
+tsconfig*.json
+vitest.config.ts

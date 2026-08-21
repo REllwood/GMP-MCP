@@ -6,6 +6,7 @@ import {
   assertTrustedDownloadUrl,
   normaliseApiPath as normaliseGoogleApiPath
 } from "./googleApiClient.js";
+import { idString } from "./schemas.js";
 
 describe("normaliseApiPath", () => {
   it("accepts paths with or without a leading slash", () => {
@@ -65,5 +66,14 @@ describe("report download URL validation", () => {
     expect(() => assertTrustedDownloadUrl(new URL("http://storage.googleapis.com/report.csv"))).toThrow(
       /HTTPS/
     );
+  });
+});
+
+describe("Google API identifiers", () => {
+  it("accepts normal IDs and rejects path-changing values", () => {
+    expect(idString.safeParse("GTM-ABC_123").success).toBe(true);
+    expect(idString.safeParse("../advertisers/2").success).toBe(false);
+    expect(idString.safeParse("1%2Fcampaigns%2F2").success).toBe(false);
+    expect(idString.safeParse("1?alt=media").success).toBe(false);
   });
 });

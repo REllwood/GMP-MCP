@@ -24,10 +24,8 @@ The server can be verified locally with the standard project checks. Live Google
 Run:
 
 ```bash
-npm run typecheck
-npm test
-npm run build
-npm audit
+npm run check
+npm audit --omit=dev
 ```
 
 Expected results:
@@ -61,6 +59,7 @@ The server is designed around these rules:
 - Read operations should be easy to call.
 - Write operations should exist, but must be deliberate.
 - Every live write must be previewed with `dryRun=true` first.
+- The live request must exactly match an unexpired preview and each preview can be used once.
 - Every live write must require `dryRun=false` and `confirm=true`.
 - Product-level allowlists should reduce accidental blast radius.
 - Product-native Google permissions remain the primary security boundary.
@@ -75,17 +74,18 @@ Write-capable tools are registered by default, but live writes are blocked unles
 A live write requires:
 
 - A write flag enabled globally or for the relevant product.
+- An exact matching dry-run preview created by the current server process within the previous 15 minutes.
 - `dryRun=false`.
 - `confirm=true`.
 
-By default, write tools behave as previews. The dry-run response shows the request method, path, query and body that would be sent to Google.
+By default, write tools behave as previews. The dry-run response shows the request method, path, query and body that would be sent to Google, plus the preview expiry time. The server records a canonical digest of that request in memory. A changed payload, an expired preview, a reused preview or a server restart blocks live execution and requires a new dry run.
 
 The intended usage pattern is:
 
 1. Ask the assistant to prepare the change with `dryRun=true`.
 2. Review the returned request payload.
 3. Confirm the intended account, advertiser, campaign, property, container or customer.
-4. Re-run with `dryRun=false` and `confirm=true`.
+4. Re-run the exact request with `dryRun=false` and `confirm=true` before the preview expires.
 5. Review the audit log.
 
 Example dry-run instruction to an assistant:
@@ -132,10 +132,12 @@ Example cautious DV360-only setup:
 GMP_ENABLE_WRITES=false
 DV360_ENABLE_WRITES=true
 DV360_ALLOWED_ADVERTISER_IDS=123456
-DV360_ALLOWED_CAMPAIGN_IDS=987654
-DV360_ALLOWED_INSERTION_ORDER_IDS=111222
+DV360_ALLOWED_CAMPAIGN_IDS=
+DV360_ALLOWED_INSERTION_ORDER_IDS=
 DV360_ALLOWED_LINE_ITEM_IDS=
 ```
+
+Keep a child-resource allowlist empty while creating that type of resource because its Google-generated ID is not known in advance. After creation, add the returned ID to the allowlist and restart the MCP server before modifying it further.
 
 ## Raw Request Tools
 
@@ -164,10 +166,10 @@ Use raw request tools only when:
 
 - A required endpoint is missing from the first-class tools.
 - You have checked the official Google API docs for the exact request shape.
-- You can supply IDs for the relevant allowlist checks.
+- The actual request path contains every ID required by the configured allowlists.
 - You are comfortable with the request being less guided than a first-class tool.
 
-When an allowlist is configured for a product, raw request tools require the matching ID field to be supplied as tool metadata. Putting the ID only inside the path is intentionally rejected because it would make allowlist enforcement unreliable.
+When an allowlist is configured, the server extracts target IDs from the canonical raw request path and validates those IDs directly. Optional metadata must match the path but is never accepted as proof of scope. A raw endpoint that does not expose a configured allowlist target in its path is blocked; add a first-class tool with endpoint-aware validation instead.
 
 ## Audit Logs
 
@@ -188,7 +190,7 @@ Each line is JSON. It includes:
 - Redacted query parameters.
 - Redacted request body.
 
-The audit log is not a replacement for Google product audit logs. It is a local record of what the MCP server was asked to do.
+The audit log is not a replacement for Google product audit logs. It is a local record of what the MCP server was asked to do. If the pre-request audit record cannot be written, the Google request is blocked. If Google succeeds but the completion record fails, the tool returns the confirmed Google result with an `audit_log_failed` warning instead of reporting the remote operation as failed.
 
 ## Allowlists
 
@@ -225,7 +227,7 @@ When a more specific allowlist is configured, broad list tools that cannot const
 
 CM360 note:
 
-Several CM360 report, tag, conversion and object endpoints are profile-level even when the underlying data belongs to an advertiser. When `CM360_ALLOWED_ADVERTISER_IDS` is set, those tools require an `advertiserId` metadata field so the MCP server can enforce the allowlist before making the request.
+CM360 object reads and patches verify the advertiser ID returned by Google instead of trusting caller metadata. Campaign-scoped tag and association tools verify the owning campaign when needed. Profile-level report and offline-conversion endpoints do not expose a reliably verifiable advertiser target, so those tools are blocked while `CM360_ALLOWED_ADVERTISER_IDS` is configured. Use CM360-native credential permissions as the boundary for those endpoints.
 
 ## Authentication Options
 
@@ -359,10 +361,8 @@ npm run build
 Run checks:
 
 ```bash
-npm run typecheck
-npm test
-npm run build
-npm audit
+npm run check
+npm audit --omit=dev
 ```
 
 Start directly for local development:
@@ -491,7 +491,7 @@ Use this checklist before enabling live writes:
 10. Inspect `.gmp-mcp/audit.log`.
 11. Confirm the dry-run payload is correct.
 12. Enable the product-specific write flag.
-13. Run the exact same request with `dryRun=false` and `confirm=true`.
+13. Within 15 minutes, run the exact same request with `dryRun=false` and `confirm=true`.
 14. Inspect the product UI and product audit logs.
 15. Disable writes again when live write access is no longer needed.
 
@@ -513,6 +513,8 @@ Recommended discovery flow:
 8. `cm360_list_floodlight_activities`
 
 Recommended reporting flow:
+
+These profile-level report tools require `CM360_ALLOWED_ADVERTISER_IDS` to be empty because CM360 does not provide a reliable advertiser target for pre-request validation.
 
 1. `cm360_list_reports`
 2. `cm360_get_report`
@@ -572,7 +574,7 @@ Recommended targeting flow:
 
 1. Use `dv360_list_targeting_options` to inspect allowed targeting values.
 2. Use `dv360_list_assigned_targeting_options` to inspect current targeting.
-3. Use `dv360_assign_targeting_option` for insertion order or line item level targeting.
+3. Use `dv360_assign_targeting_option` for line item targeting. Google has sunset campaign and insertion-order assigned-targeting resources.
 4. Use `dv360_bulk_edit_line_item_targeting` for broader line item targeting changes.
 5. Keep all targeting mutations dry-run-first.
 
@@ -630,7 +632,7 @@ Recommended reporting flow:
 Recommended configuration flow:
 
 1. Read the property with `ga4_get_property`.
-2. Inspect current custom dimensions, metrics, key events, conversion events and audiences.
+2. Inspect current custom dimensions, metrics, key events and audiences.
 3. Prepare the config payload.
 4. Run the create or patch tool with `dryRun=true`.
 5. Review names, scope, event names and update masks.
@@ -644,7 +646,7 @@ GA4 tool groups:
 - Custom dimensions: `ga4_list_custom_dimensions`, `ga4_get_custom_dimension`, `ga4_create_custom_dimension`, `ga4_patch_custom_dimension`, `ga4_archive_custom_dimension`
 - Custom metrics: `ga4_list_custom_metrics`, `ga4_get_custom_metric`, `ga4_create_custom_metric`, `ga4_patch_custom_metric`, `ga4_archive_custom_metric`
 - Key events: `ga4_list_key_events`, `ga4_get_key_event`, `ga4_create_key_event`, `ga4_patch_key_event`
-- Conversion events: `ga4_list_conversion_events`, `ga4_get_conversion_event`, `ga4_create_conversion_event`, `ga4_patch_conversion_event`
+- Legacy conversion events: `ga4_list_conversion_events`, `ga4_get_conversion_event`, `ga4_create_conversion_event`, `ga4_patch_conversion_event`. Google has deprecated these methods; use key event tools for new integrations.
 - Audiences: `ga4_list_audiences`, `ga4_get_audience`, `ga4_create_audience`, `ga4_patch_audience`
 - Reporting: `ga4_get_metadata`, `ga4_run_report`, `ga4_batch_run_reports`, `ga4_run_realtime_report`
 - Advanced: `ga4_api_request`
@@ -772,6 +774,7 @@ Check:
 Check:
 
 - The relevant write flag is enabled.
+- An identical `dryRun=true` request completed in the current server process within the previous 15 minutes.
 - The tool call includes `dryRun=false`.
 - The tool call includes `confirm=true`.
 - The target ID is in the relevant allowlist.
@@ -840,6 +843,7 @@ Project scripts:
 
 ```bash
 npm run dev
+npm run check
 npm run typecheck
 npm test
 npm run build
@@ -852,11 +856,14 @@ Important files:
 - `src/config.ts`: environment config, scopes, base URLs and allowlists.
 - `src/safety.ts`: dry-run, confirmation, write flags, allowlists and audit logging.
 - `src/googleApiClient.ts`: shared Google REST client.
+- `src/http.ts`: bounded response streaming for report downloads.
 - `src/tools.ts`: CM360 tools.
 - `src/dv360Tools.ts`: DV360 and Bid Manager tools.
 - `src/ga4Tools.ts`: GA4 Admin and Data API tools.
 - `src/gtmTools.ts`: GTM tools.
 - `src/sa360Tools.ts`: SA360 tools.
+
+GitHub Actions runs `npm ci`, the full project check, a production dependency audit and an npm package inspection for pushes to `main` and pull requests.
 
 ## Official References
 

@@ -17,11 +17,12 @@ import {
 } from "./schemas.js";
 import {
   assertRawRequestAllowedEntities,
-  auditMutation,
+  auditLiveCompletion,
   assertBroadListAllowed,
   assertEntityAllowed,
   assertEntityIdsAllowed,
-  guardMutation
+  guardMutation,
+  SafetyError
 } from "./safety.js";
 
 interface ToolContext {
@@ -134,7 +135,7 @@ function registerReadTools(server: McpServer, { client, config }: ToolContext): 
     async ({ profileId, advertiserId, query }) =>
       safeRun(async () => {
         assertEntityAllowed("profile", profileId, config.allowedProfileIds);
-        assertRequiredEntityAllowed("advertiser", advertiserId, config.allowedAdvertiserIds);
+        assertUnscopedCm360AdvertiserAccess(config, "cm360_list_reports");
         return jsonResult(
           await client.request({
             method: "GET",
@@ -154,7 +155,7 @@ function registerReadTools(server: McpServer, { client, config }: ToolContext): 
     async ({ profileId, advertiserId, id }) =>
       safeRun(async () => {
         assertEntityAllowed("profile", profileId, config.allowedProfileIds);
-        assertRequiredEntityAllowed("advertiser", advertiserId, config.allowedAdvertiserIds);
+        assertUnscopedCm360AdvertiserAccess(config, "cm360_get_report");
         return jsonResult(
           await client.request({
             method: "GET",
@@ -178,7 +179,7 @@ function registerReadTools(server: McpServer, { client, config }: ToolContext): 
     async ({ profileId, advertiserId, reportId, query }) =>
       safeRun(async () => {
         assertEntityAllowed("profile", profileId, config.allowedProfileIds);
-        assertRequiredEntityAllowed("advertiser", advertiserId, config.allowedAdvertiserIds);
+        assertUnscopedCm360AdvertiserAccess(config, "cm360_list_report_files");
         return jsonResult(
           await client.request({
             method: "GET",
@@ -203,7 +204,7 @@ function registerReadTools(server: McpServer, { client, config }: ToolContext): 
     async ({ profileId, advertiserId, reportId, fileId }) =>
       safeRun(async () => {
         assertEntityAllowed("profile", profileId, config.allowedProfileIds);
-        assertRequiredEntityAllowed("advertiser", advertiserId, config.allowedAdvertiserIds);
+        assertUnscopedCm360AdvertiserAccess(config, "cm360_get_report_file_status");
         return jsonResult(
           await client.request({
             method: "GET",
@@ -221,7 +222,8 @@ function registerWriteTools(server: McpServer, context: ToolContext): void {
     toolName: "cm360_create_campaign",
     resource: "campaigns",
     description: "Create a CM360 campaign. Live execution requires dryRun=false, confirm=true and CM360_ENABLE_WRITES=true.",
-    advertiserIdFromBody: true
+    advertiserIdFromBody: true,
+    createdEntityAllowlist: "campaign"
   });
 
   registerPatchTool(server, context, {
@@ -307,7 +309,16 @@ function registerWriteTools(server: McpServer, context: ToolContext): void {
     },
     async ({ profileId, advertiserId, campaignId, association, dryRun, confirm }) =>
       safeRun(async () => {
-        assertRequiredEntityAllowed("advertiser", advertiserId, config.allowedAdvertiserIds);
+        const scope = await resolveCm360ResourceScope({
+          client,
+          config,
+          profileId,
+          resource: "campaigns",
+          id: campaignId,
+          declaredAdvertiserId: advertiserId,
+          declaredCampaignId: campaignId,
+          campaignIdFromResourceId: true
+        });
         const request = {
           method: "POST" as const,
           path: `/userprofiles/${profileId}/campaigns/${campaignId}/campaignCreativeAssociations`,
@@ -316,7 +327,7 @@ function registerWriteTools(server: McpServer, context: ToolContext): void {
         const guard = await guardMutation(config, {
           toolName: "cm360_associate_creative_to_campaign",
           profileId,
-          advertiserId,
+          advertiserId: scope.advertiserId,
           campaignId,
           dryRun,
           confirm,
@@ -328,14 +339,14 @@ function registerWriteTools(server: McpServer, context: ToolContext): void {
         }
 
         const result = await client.request(request);
-        await auditMutation(config, {
+        const warning = await auditLiveCompletion(config, {
           toolName: "cm360_associate_creative_to_campaign",
           profileId,
-          advertiserId,
+          advertiserId: scope.advertiserId,
           campaignId,
           request
-        }, "live_completed");
-        return jsonResult(result);
+        });
+        return jsonResult(warning ? { result, warning } : result);
       })
   );
 
@@ -349,24 +360,40 @@ function registerWriteTools(server: McpServer, context: ToolContext): void {
         advertiserId: idString.optional(),
         campaignId: idString,
         placementIds: z.array(idString).optional(),
-        tagFormats: z.array(z.string()).optional(),
-        tagProperties: z.record(z.string(), z.unknown()).optional()
+        tagFormats: z.array(z.string().min(1)).optional(),
+        tagProperties: z
+          .object({
+            tcfGdprMacrosIncluded: z.boolean().optional(),
+            gppMacrosIncluded: z.boolean().optional(),
+            dcDbmMacroIncluded: z.boolean().optional()
+          })
+          .strict()
+          .optional()
       })
     },
     async ({ profileId, advertiserId, campaignId, placementIds, tagFormats, tagProperties }) =>
       safeRun(async () => {
-        assertEntityAllowed("profile", profileId, config.allowedProfileIds);
-        assertRequiredEntityAllowed("advertiser", advertiserId, config.allowedAdvertiserIds);
-        assertEntityAllowed("campaign", campaignId, config.allowedCampaignIds);
+        await resolveCm360ResourceScope({
+          client,
+          config,
+          profileId,
+          resource: "campaigns",
+          id: campaignId,
+          declaredAdvertiserId: advertiserId,
+          declaredCampaignId: campaignId,
+          campaignIdFromResourceId: true
+        });
         return jsonResult(
           await client.request({
             method: "POST",
             path: `/userprofiles/${profileId}/placements/generatetags`,
             query: {
               campaignId,
-              "placementIds[]": placementIds,
-              "tagFormats[]": tagFormats,
-              tagProperties: tagProperties ? JSON.stringify(tagProperties) : undefined
+              placementIds,
+              tagFormats,
+              "tagProperties.tcfGdprMacrosIncluded": tagProperties?.tcfGdprMacrosIncluded,
+              "tagProperties.gppMacrosIncluded": tagProperties?.gppMacrosIncluded,
+              "tagProperties.dcDbmMacroIncluded": tagProperties?.dcDbmMacroIncluded
             }
           })
         );
@@ -386,7 +413,7 @@ function registerWriteTools(server: McpServer, context: ToolContext): void {
     },
     async ({ profileId, advertiserId, report, dryRun, confirm }) =>
       safeRun(async () => {
-        assertRequiredEntityAllowed("advertiser", advertiserId, config.allowedAdvertiserIds);
+        assertUnscopedCm360AdvertiserAccess(config, "cm360_create_report");
         return runGuardedRequest({
           client,
           config,
@@ -418,7 +445,7 @@ function registerWriteTools(server: McpServer, context: ToolContext): void {
     async ({ profileId, advertiserId, reportId, synchronous }) =>
       safeRun(async () => {
         assertEntityAllowed("profile", profileId, config.allowedProfileIds);
-        assertRequiredEntityAllowed("advertiser", advertiserId, config.allowedAdvertiserIds);
+        assertUnscopedCm360AdvertiserAccess(config, "cm360_run_report");
         return jsonResult(
           await client.request({
             method: "POST",
@@ -446,7 +473,7 @@ function registerWriteTools(server: McpServer, context: ToolContext): void {
     async ({ profileId, advertiserId, reportId, fileId, fileName, maxPreviewBytes }) =>
       safeRun(async () => {
         assertEntityAllowed("profile", profileId, config.allowedProfileIds);
-        assertRequiredEntityAllowed("advertiser", advertiserId, config.allowedAdvertiserIds);
+        assertUnscopedCm360AdvertiserAccess(config, "cm360_download_report_file");
         return jsonResult(
           await client.downloadReportFile({
             profileId,
@@ -473,7 +500,7 @@ function registerWriteTools(server: McpServer, context: ToolContext): void {
     },
     async ({ profileId, advertiserId, request, dryRun, confirm }) =>
       safeRun(async () => {
-        assertRequiredEntityAllowed("advertiser", advertiserId, config.allowedAdvertiserIds);
+        assertUnscopedCm360AdvertiserAccess(config, "cm360_upload_offline_conversions");
         return runGuardedRequest({
           client,
           config,
@@ -595,16 +622,16 @@ function registerListAndGet(
         const id = input.id;
         const advertiserId = stringField(input as Record<string, unknown>, "advertiserId");
         assertEntityAllowed("profile", profileId, config.allowedProfileIds);
-        if (options.advertiserScoped) {
-          assertRequiredEntityAllowed("advertiser", advertiserId, config.allowedAdvertiserIds);
-        }
+        assertEntityAllowed("advertiser", advertiserId, config.allowedAdvertiserIds);
         assertEntityAllowed(options.singularDescriptionName, id, options.idAllowlist ?? new Set());
-        return jsonResult(
-          await client.request({
-            method: "GET",
-            path: `/userprofiles/${profileId}/${options.resource}/${id}`
-          })
-        );
+        const result = await client.request({
+          method: "GET",
+          path: `/userprofiles/${profileId}/${options.resource}/${id}`
+        });
+        if (options.advertiserScoped) {
+          verifyCm360ResourceAdvertiser(config, result, advertiserId);
+        }
+        return jsonResult(result);
       })
   );
 }
@@ -618,6 +645,7 @@ function registerCreateTool(
     description: string;
     advertiserIdFromBody?: boolean;
     campaignIdFromBody?: boolean;
+    createdEntityAllowlist?: "campaign";
   }
 ): void {
   server.registerTool(
@@ -632,6 +660,9 @@ function registerCreateTool(
     },
     async ({ profileId, resource, dryRun, confirm }) =>
       safeRun(async () => {
+        if (options.createdEntityAllowlist === "campaign") {
+          assertCreateAllowed("campaign", context.config.allowedCampaignIds);
+        }
         const advertiserId = options.advertiserIdFromBody ? stringField(resource, "advertiserId") : undefined;
         const campaignId = options.campaignIdFromBody ? stringField(resource, "campaignId") : undefined;
         if (options.advertiserIdFromBody) {
@@ -685,27 +716,35 @@ function registerPatchTool(
     },
     async ({ profileId, advertiserId, id, patch, dryRun, confirm }) =>
       safeRun(async () => {
-        const campaignId = options.campaignIdFromId
+        const patchAdvertiserId = stringField(patch, "advertiserId");
+        const declaredAdvertiserId = matchingDeclaredId(
+          "advertiser",
+          advertiserId,
+          patchAdvertiserId
+        );
+        const declaredCampaignId = options.campaignIdFromId
           ? id
           : options.campaignIdFromBody
             ? stringField(patch, "campaignId")
             : undefined;
-        const scopedAdvertiserId = options.advertiserScoped
-          ? advertiserId ?? stringField(patch, "advertiserId")
-          : undefined;
-        if (options.advertiserScoped) {
-          assertRequiredEntityAllowed("advertiser", scopedAdvertiserId, context.config.allowedAdvertiserIds);
-        }
-        if (options.campaignIdFromId || options.campaignIdFromBody) {
-          assertRequiredEntityAllowed("campaign", campaignId, context.config.allowedCampaignIds);
-        }
+        const scope = await resolveCm360ResourceScope({
+          client: context.client,
+          config: context.config,
+          profileId,
+          resource: options.resource,
+          id,
+          declaredAdvertiserId: options.advertiserScoped ? declaredAdvertiserId : undefined,
+          declaredCampaignId,
+          campaignIdFromResourceId: options.campaignIdFromId,
+          verifyCampaign: options.campaignIdFromId || options.campaignIdFromBody
+        });
         return runGuardedRequest({
           client: context.client,
           config: context.config,
           toolName: options.toolName,
           profileId,
-          advertiserId: scopedAdvertiserId,
-          campaignId,
+          advertiserId: scope.advertiserId,
+          campaignId: scope.campaignId,
           dryRun,
           confirm,
           request: {
@@ -751,15 +790,15 @@ async function runGuardedRequest(args: {
     }
 
     const result = await args.client.request(args.request);
-    await auditMutation(args.config, {
+    const warning = await auditLiveCompletion(args.config, {
       toolName: args.toolName,
       profileId: args.profileId,
       advertiserId: args.advertiserId,
       campaignId: args.campaignId,
       request: args.request
-    }, "live_completed");
+    });
 
-    return jsonResult(result);
+    return jsonResult(warning ? { result, warning } : result);
   });
 }
 
@@ -782,6 +821,145 @@ function stringField(value: Record<string, unknown>, key: string): string | unde
   }
 
   return undefined;
+}
+
+interface Cm360Scope {
+  advertiserId?: string;
+  campaignId?: string;
+}
+
+async function resolveCm360ResourceScope(args: {
+  client: Cm360Client;
+  config: ServerConfig;
+  profileId: string;
+  resource: string;
+  id: string;
+  declaredAdvertiserId?: string;
+  declaredCampaignId?: string;
+  campaignIdFromResourceId?: boolean;
+  verifyCampaign?: boolean;
+}): Promise<Cm360Scope> {
+  assertEntityAllowed("profile", args.profileId, args.config.allowedProfileIds);
+  assertEntityAllowed("advertiser", args.declaredAdvertiserId, args.config.allowedAdvertiserIds);
+  assertEntityAllowed("campaign", args.declaredCampaignId, args.config.allowedCampaignIds);
+
+  const verifyAdvertiser = args.config.allowedAdvertiserIds.size > 0;
+  const verifyCampaign =
+    Boolean(args.verifyCampaign ?? args.campaignIdFromResourceId) &&
+    args.config.allowedCampaignIds.size > 0;
+  const mustFetch =
+    verifyAdvertiser || (verifyCampaign && !args.campaignIdFromResourceId);
+
+  let resource: Record<string, unknown> | undefined;
+  if (mustFetch) {
+    const result = await args.client.request({
+      method: "GET",
+      path: `/userprofiles/${args.profileId}/${args.resource}/${args.id}`
+    });
+    resource = asJsonObject(result, args.resource);
+  }
+
+  let advertiserId = args.declaredAdvertiserId;
+  if (verifyAdvertiser) {
+    const actualAdvertiserId = stringField(resource ?? {}, "advertiserId");
+    if (!actualAdvertiserId) {
+      throw new SafetyError(
+        `CM360 ${args.resource} ${args.id} did not expose an advertiserId, so its advertiser allowlist could not be verified.`
+      );
+    }
+    assertEntityAllowed("advertiser", actualAdvertiserId, args.config.allowedAdvertiserIds);
+    assertDeclaredIdMatches("advertiser", args.declaredAdvertiserId, actualAdvertiserId);
+    advertiserId = actualAdvertiserId;
+  }
+
+  let campaignId = args.declaredCampaignId;
+  if (verifyCampaign) {
+    const actualCampaignId = args.campaignIdFromResourceId
+      ? args.id
+      : stringField(resource ?? {}, "campaignId");
+    if (!actualCampaignId) {
+      throw new SafetyError(
+        `CM360 ${args.resource} ${args.id} did not expose a campaignId, so its campaign allowlist could not be verified.`
+      );
+    }
+    assertEntityAllowed("campaign", actualCampaignId, args.config.allowedCampaignIds);
+    assertDeclaredIdMatches("campaign", args.declaredCampaignId, actualCampaignId);
+    campaignId = actualCampaignId;
+  }
+
+  return { advertiserId, campaignId };
+}
+
+function verifyCm360ResourceAdvertiser(
+  config: ServerConfig,
+  value: unknown,
+  declaredAdvertiserId: string | undefined
+): void {
+  if (config.allowedAdvertiserIds.size === 0) {
+    return;
+  }
+
+  const resource = asJsonObject(value, "resource");
+  const actualAdvertiserId = stringField(resource, "advertiserId");
+  if (!actualAdvertiserId) {
+    throw new SafetyError(
+      "CM360 did not return an advertiserId, so the advertiser allowlist could not be verified."
+    );
+  }
+
+  assertEntityAllowed("advertiser", actualAdvertiserId, config.allowedAdvertiserIds);
+  assertDeclaredIdMatches("advertiser", declaredAdvertiserId, actualAdvertiserId);
+}
+
+function asJsonObject(value: unknown, resourceName: string): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new SafetyError(`CM360 ${resourceName} response was not a JSON object.`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function matchingDeclaredId(
+  entityName: string,
+  ...ids: Array<string | undefined>
+): string | undefined {
+  const values = [...new Set(ids.filter((id): id is string => Boolean(id)))];
+  if (values.length > 1) {
+    throw new SafetyError(
+      `Conflicting ${entityName} IDs were supplied in metadata and the request body.`
+    );
+  }
+  return values[0];
+}
+
+function assertDeclaredIdMatches(
+  entityName: string,
+  declaredId: string | undefined,
+  actualId: string
+): void {
+  if (declaredId && declaredId !== actualId) {
+    throw new SafetyError(
+      `Declared ${entityName} ${declaredId} does not own the targeted CM360 resource; Google returned ${actualId}.`
+    );
+  }
+}
+
+function assertCreateAllowed(entityName: string, allowlist: Set<string>): void {
+  if (allowlist.size > 0) {
+    throw new SafetyError(
+      `Creating a new ${entityName} is blocked while its ID allowlist is configured because the new ID is not known in advance.`
+    );
+  }
+}
+
+function assertUnscopedCm360AdvertiserAccess(
+  config: ServerConfig,
+  toolName: string
+): void {
+  if (config.allowedAdvertiserIds.size > 0) {
+    throw new SafetyError(
+      `${toolName} is blocked because CM360 does not expose an advertiser target that can be verified before this request. Use a narrower first-class tool or a credential restricted in CM360.`
+    );
+  }
 }
 
 function assertRequiredEntityAllowed(
