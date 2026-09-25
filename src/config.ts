@@ -1,4 +1,5 @@
 import "dotenv/config";
+import os from "node:os";
 import path from "node:path";
 
 export const GMP_SCOPES = [
@@ -30,6 +31,18 @@ export type GmpProduct =
   | "gtm"
   | "sa360";
 
+export const ALL_GMP_PRODUCTS: readonly GmpProduct[] = ["cm360", "dv360", "bidManager", "ga4", "gtm", "sa360"];
+
+const productAliases: Record<string, GmpProduct> = {
+  cm360: "cm360",
+  dv360: "dv360",
+  bidmanager: "bidManager",
+  bid_manager: "bidManager",
+  ga4: "ga4",
+  gtm: "gtm",
+  sa360: "sa360"
+};
+
 export interface ServerConfig {
   apiBaseUrl: string;
   dv360ApiBaseUrl: string;
@@ -41,6 +54,7 @@ export interface ServerConfig {
   sa360ApiBaseUrl: string;
   sa360LegacyApiBaseUrl: string;
   scopes: string[];
+  enabledProducts: Set<GmpProduct>;
   authMode: AuthMode;
   serviceAccountKeyFile?: string;
   delegatedSubject?: string;
@@ -151,9 +165,37 @@ function parseAuthMode(value: string | undefined): AuthMode {
   return "auto";
 }
 
-function resolveWorkspacePath(value: string | undefined, fallback: string): string {
-  const target = value ?? fallback;
-  return path.isAbsolute(target) ? target : path.resolve(process.cwd(), target);
+// Unset paths default under the home directory, so they work even when an MCP client launches the
+// server from "/". Explicit relative paths still resolve against the working directory.
+function resolveDataPath(value: string | undefined, homeRelativeFallback: string): string {
+  if (value === undefined) {
+    return path.join(os.homedir(), homeRelativeFallback);
+  }
+
+  return path.isAbsolute(value) ? value : path.resolve(process.cwd(), value);
+}
+
+export function parseEnabledProducts(value: string | undefined): Set<GmpProduct> {
+  const names = (value ?? "")
+    .split(/[\s,]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+
+  if (names.length === 0) {
+    return new Set(ALL_GMP_PRODUCTS);
+  }
+
+  return new Set(
+    names.map((name) => {
+      const product = productAliases[name.toLowerCase()];
+      if (!product) {
+        throw new Error(
+          `GMP_PRODUCTS contains unknown product "${name}". Use any of: cm360, dv360, bidmanager, ga4, gtm, sa360.`
+        );
+      }
+      return product;
+    })
+  );
 }
 
 function productFlag(productName: string, suffix: "ENABLE_WRITES" | "ENABLE_RAW_REQUEST", fallback: boolean): boolean {
@@ -260,6 +302,7 @@ export function loadConfig(): ServerConfig {
       allowUnsafeBaseUrls
     ),
     scopes: parseScopes(envValue("GMP_SCOPES"), GMP_SCOPES),
+    enabledProducts: parseEnabledProducts(envValue("GMP_PRODUCTS")),
     authMode: parseAuthMode(envValue("GMP_AUTH_MODE") ?? envValue("CM360_AUTH_MODE")),
     serviceAccountKeyFile:
       envValue("GMP_SERVICE_ACCOUNT_KEY_FILE") ??
@@ -301,13 +344,13 @@ export function loadConfig(): ServerConfig {
     allowedGtmAccountIds: parseCsvSet(envValue("GTM_ALLOWED_ACCOUNT_IDS")),
     allowedGtmContainerIds: parseCsvSet(envValue("GTM_ALLOWED_CONTAINER_IDS")),
     allowedSa360CustomerIds: parseCsvSet(envValue("SA360_ALLOWED_CUSTOMER_IDS")),
-    auditLogPath: resolveWorkspacePath(
+    auditLogPath: resolveDataPath(
       envValue("GMP_AUDIT_LOG_PATH") ?? envValue("CM360_AUDIT_LOG_PATH"),
-      ".gmp-mcp/audit.log"
+      path.join(".gmp-mcp", "audit.log")
     ),
-    downloadDir: resolveWorkspacePath(
+    downloadDir: resolveDataPath(
       envValue("GMP_DOWNLOAD_DIR") ?? envValue("CM360_DOWNLOAD_DIR"),
-      ".gmp-mcp/downloads"
+      path.join(".gmp-mcp", "downloads")
     ),
     requestsPerSecond: parseNumber(envValue("GMP_REQUESTS_PER_SECOND") ?? envValue("CM360_REQUESTS_PER_SECOND"), 1),
     maxRetries: parseNonNegativeInteger(

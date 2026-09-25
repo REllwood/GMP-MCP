@@ -1,7 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod/v4";
 
-import type { HttpMethod } from "./cm360Client.js";
 import type { ServerConfig } from "./config.js";
 import type { GoogleApiClient } from "./googleApiClient.js";
 import { jsonResult } from "./response.js";
@@ -18,15 +17,26 @@ import {
   assertAllowedEntities,
   assertBroadListAllowed,
   assertEntityAllowed,
-  assertEntityIdsAllowed
+  assertEntityIdsAllowed,
+  SafetyError
 } from "./safety.js";
 import { runGuardedGoogleRequest, runRawGoogleRequest, safeRun, stringField } from "./toolHelpers.js";
 
 interface Dv360ToolContext {
   dv360Client: GoogleApiClient;
+  config: ServerConfig;
+}
+
+interface BidManagerToolContext {
   bidManagerClient: GoogleApiClient;
   config: ServerConfig;
 }
+
+type Dv360Resource = "campaigns" | "insertionOrders" | "lineItems" | "creatives";
+
+// Each line item in a bulk request costs one rate-limited lookup when campaign or insertion order
+// allowlists are set. Kept low so the lookups finish well inside a typical 60 second client timeout.
+const maxVerifiedLineItems = 20;
 
 const advertiserInput = z.object({
   advertiserId: idString
@@ -37,11 +47,30 @@ const advertiserListInput = z.object({
   query: querySchema
 });
 
+const rawInput = z.object({
+  method: z.enum(["GET", "POST", "PATCH", "PUT", "DELETE"]),
+  path: z.string().min(1),
+  query: querySchema,
+  body: z.unknown().optional(),
+  partnerId: idString.optional(),
+  advertiserId: idString.optional(),
+  campaignId: idString.optional(),
+  insertionOrderId: idString.optional(),
+  lineItemId: idString.optional(),
+  queryId: idString.optional(),
+  dryRun: dryRunSchema,
+  confirm: confirmSchema
+});
+
 export function registerDv360Tools(server: McpServer, context: Dv360ToolContext): void {
   registerDv360ReadTools(server, context);
   registerDv360WriteTools(server, context);
-  registerBidManagerTools(server, context);
-  registerDv360RawTools(server, context);
+  registerDv360RawTool(server, context);
+}
+
+export function registerBidManagerTools(server: McpServer, context: BidManagerToolContext): void {
+  registerBidManagerQueryTools(server, context);
+  registerBidManagerRawTool(server, context);
 }
 
 function registerDv360ReadTools(server: McpServer, { dv360Client, config }: Dv360ToolContext): void {
@@ -74,12 +103,16 @@ function registerDv360ReadTools(server: McpServer, { dv360Client, config }: Dv36
   server.registerTool(
     "dv360_list_advertisers",
     {
-      description: "List Display & Video 360 advertisers.",
+      description: "List Display & Video 360 advertisers for the partner in query.partnerId.",
       inputSchema: z.object({ query: querySchema })
     },
     async ({ query }) =>
       safeRun(async () => {
         assertBroadListAllowed("DV360 advertiser", config.allowedDv360AdvertiserIds);
+        assertNoQueryAliases(query, ["partnerId"]);
+        assertEntityIdsAllowed("DV360 partner", queryValues(query?.partnerId), config.allowedDv360PartnerIds, {
+          requireWhenAllowlisted: true
+        });
         return jsonResult(await dv360Client.request({ method: "GET", path: "/advertisers", query }));
       })
   );
@@ -92,8 +125,10 @@ function registerDv360ReadTools(server: McpServer, { dv360Client, config }: Dv36
     },
     async ({ advertiserId }) =>
       safeRun(async () => {
-        assertAllowedEntities(config, { product: "dv360", toolName: "dv360_get_advertiser", advertiserId, request: { method: "GET", path: `/advertisers/${advertiserId}` } });
-        return jsonResult(await dv360Client.request({ method: "GET", path: `/advertisers/${advertiserId}` }));
+        const path = `/advertisers/${advertiserId}`;
+        assertAllowedEntities(config, { product: "dv360", toolName: "dv360_get_advertiser", advertiserId, request: { method: "GET", path } });
+        const scope = await resolveDv360AdvertiserScope(dv360Client, config, advertiserId);
+        return jsonResult(scope.object ?? (await dv360Client.request({ method: "GET", path })));
       })
   );
 
@@ -175,6 +210,10 @@ function registerDv360ReadTools(server: McpServer, { dv360Client, config }: Dv36
           lineItemId,
           request: { method: "GET", path }
         });
+        await resolveDv360AdvertiserScope(dv360Client, config, advertiserId);
+        if (level === "lineItem" && lineItemId) {
+          await resolveLineItemOwners(dv360Client, config, advertiserId, lineItemId);
+        }
         return jsonResult(
           await dv360Client.request({
             method: "GET",
@@ -191,28 +230,33 @@ function registerDv360ReadTools(server: McpServer, { dv360Client, config }: Dv36
       description: "Bulk list assigned targeting options for multiple DV360 line items across targeting types.",
       inputSchema: z.object({
         advertiserId: idString,
-        lineItemIds: z.array(idString).optional().describe("Line item IDs expected to be queried. Required when DV360_ALLOWED_LINE_ITEM_IDS is configured."),
+        lineItemIds: z.array(idString).optional().describe("Line item IDs to query. Required when DV360 line item, insertion order or campaign allowlists are configured."),
         query: querySchema
       })
     },
     async ({ advertiserId, lineItemIds, query }) =>
       safeRun(async () => {
-        assertEntityIdsAllowed("DV360 line item", lineItemIds, config.allowedDv360LineItemIds, {
+        const path = `/advertisers/${advertiserId}/lineItems:bulkListAssignedTargetingOptions`;
+        assertNoQueryAliases(query, ["lineItemIds"]);
+        const targetLineItemIds = lineItemIds ?? queryValues(query?.lineItemIds);
+        assertEntityIdsAllowed("DV360 line item", targetLineItemIds, config.allowedDv360LineItemIds, {
           requireWhenAllowlisted: true
         });
         assertAllowedEntities(config, {
           product: "dv360",
           toolName: "dv360_bulk_list_line_item_assigned_targeting_options",
           advertiserId,
-          request: { method: "GET", path: `/advertisers/${advertiserId}/lineItems:bulkListAssignedTargetingOptions` }
+          request: { method: "GET", path }
         });
+        await resolveDv360AdvertiserScope(dv360Client, config, advertiserId);
+        await verifyLineItemOwners(dv360Client, config, advertiserId, targetLineItemIds ?? []);
         return jsonResult(
           await dv360Client.request({
             method: "GET",
-            path: `/advertisers/${advertiserId}/lineItems:bulkListAssignedTargetingOptions`,
+            path,
             query: {
               ...query,
-              lineItemIds: lineItemIds ?? query?.lineItemIds
+              lineItemIds: targetLineItemIds
             }
           })
         );
@@ -259,7 +303,7 @@ function registerDv360WriteTools(server: McpServer, { dv360Client, config }: Dv3
   server.registerTool(
     "dv360_duplicate_line_item",
     {
-      description: "Duplicate a DV360 line item. Live execution requires dryRun=false and confirm=true.",
+      description: "Duplicate a DV360 line item. Blocked while DV360_ALLOWED_LINE_ITEM_IDS is configured, because the copy's ID is not known in advance.",
       inputSchema: z.object({
         advertiserId: idString,
         lineItemId: idString,
@@ -268,20 +312,29 @@ function registerDv360WriteTools(server: McpServer, { dv360Client, config }: Dv3
       })
     },
     async ({ advertiserId, lineItemId, request, dryRun, confirm }) =>
-      runGuardedGoogleRequest({
-        client: dv360Client,
-        config,
-        product: "dv360",
-        toolName: "dv360_duplicate_line_item",
-        advertiserId,
-        lineItemId,
-        dryRun,
-        confirm,
-        request: {
-          method: "POST",
+      safeRun(async () => {
+        const apiRequest = {
+          method: "POST" as const,
           path: `/advertisers/${advertiserId}/lineItems/${lineItemId}:duplicate`,
           body: request ?? {}
-        }
+        };
+        assertDv360CreateAllowed(config, "lineItemId", "line item");
+        assertAllowedEntities(config, { product: "dv360", toolName: "dv360_duplicate_line_item", advertiserId, lineItemId, request: apiRequest });
+        const scope = await resolveDv360ObjectScope(dv360Client, config, "lineItems", advertiserId, lineItemId);
+        return runGuardedGoogleRequest({
+          client: dv360Client,
+          config,
+          product: "dv360",
+          toolName: "dv360_duplicate_line_item",
+          partnerId: scope.partnerId,
+          advertiserId,
+          campaignId: scope.campaignId,
+          insertionOrderId: scope.insertionOrderId,
+          lineItemId,
+          dryRun,
+          confirm,
+          request: apiRequest
+        });
       })
   );
 
@@ -291,19 +344,20 @@ function registerDv360WriteTools(server: McpServer, { dv360Client, config }: Dv3
       description: "Bulk update DV360 line items for one advertiser.",
       inputSchema: z.object({
         advertiserId: idString,
-        lineItemIds: z.array(idString).optional().describe("Line item IDs expected to be touched by the bulk request. Required when DV360_ALLOWED_LINE_ITEM_IDS is configured and IDs cannot be inferred from the request body."),
+        lineItemIds: z.array(idString).optional().describe("Line item IDs expected to be touched by the bulk request. Required when DV360 line item, insertion order or campaign allowlists are configured and IDs cannot be inferred from the request body."),
         request: jsonObject,
         ...mutationControls
       })
     },
     async ({ advertiserId, lineItemIds, request, dryRun, confirm }) =>
       safeRun(async () => {
-        assertBulkLineItemAllowlist(config, lineItemIds, request);
+        const scope = await resolveBulkLineItemScope(dv360Client, config, advertiserId, lineItemIds, request);
         return runGuardedGoogleRequest({
           client: dv360Client,
           config,
           product: "dv360",
           toolName: "dv360_bulk_update_line_items",
+          partnerId: scope.partnerId,
           advertiserId,
           dryRun,
           confirm,
@@ -330,20 +384,28 @@ function registerDv360WriteTools(server: McpServer, { dv360Client, config }: Dv3
       })
     },
     async ({ advertiserId, targetingType, assignedTargetingOption, lineItemId, dryRun, confirm }) =>
-      runGuardedGoogleRequest({
-        client: dv360Client,
-        config,
-        product: "dv360",
-        toolName: "dv360_assign_targeting_option",
-        advertiserId,
-        lineItemId,
-        dryRun,
-        confirm,
-        request: {
-          method: "POST",
+      safeRun(async () => {
+        const apiRequest = {
+          method: "POST" as const,
           path: assignedTargetingPath({ advertiserId, targetingType, lineItemId }),
           body: assignedTargetingOption
-        }
+        };
+        assertAllowedEntities(config, { product: "dv360", toolName: "dv360_assign_targeting_option", advertiserId, lineItemId, request: apiRequest });
+        const scope = await resolveDv360ObjectScope(dv360Client, config, "lineItems", advertiserId, lineItemId);
+        return runGuardedGoogleRequest({
+          client: dv360Client,
+          config,
+          product: "dv360",
+          toolName: "dv360_assign_targeting_option",
+          partnerId: scope.partnerId,
+          advertiserId,
+          campaignId: scope.campaignId,
+          insertionOrderId: scope.insertionOrderId,
+          lineItemId,
+          dryRun,
+          confirm,
+          request: apiRequest
+        });
       })
   );
 
@@ -358,19 +420,24 @@ function registerDv360WriteTools(server: McpServer, { dv360Client, config }: Dv3
       })
     },
     async ({ advertiserId, request, dryRun, confirm }) =>
-      runGuardedGoogleRequest({
-        client: dv360Client,
-        config,
-        product: "dv360",
-        toolName: "dv360_edit_advertiser_targeting_options",
-        advertiserId,
-        dryRun,
-        confirm,
-        request: {
-          method: "POST",
-          path: `/advertisers/${advertiserId}:editAssignedTargetingOptions`,
-          body: request
-        }
+      safeRun(async () => {
+        assertEntityAllowed("DV360 advertiser", advertiserId, config.allowedDv360AdvertiserIds);
+        const { partnerId } = await resolveDv360AdvertiserScope(dv360Client, config, advertiserId);
+        return runGuardedGoogleRequest({
+          client: dv360Client,
+          config,
+          product: "dv360",
+          toolName: "dv360_edit_advertiser_targeting_options",
+          partnerId,
+          advertiserId,
+          dryRun,
+          confirm,
+          request: {
+            method: "POST",
+            path: `/advertisers/${advertiserId}:editAssignedTargetingOptions`,
+            body: request
+          }
+        });
       })
   );
 
@@ -381,15 +448,17 @@ function registerDv360WriteTools(server: McpServer, { dv360Client, config }: Dv3
       inputSchema: z.object({
         advertiserId: idString,
         lineItemId: idString.optional().describe("Optional single line item allowlist check when the request only touches one line item."),
-        lineItemIds: z.array(idString).optional().describe("Line item IDs expected to be touched by the bulk request. Required when DV360_ALLOWED_LINE_ITEM_IDS is configured and IDs cannot be inferred from the request body."),
+        lineItemIds: z.array(idString).optional().describe("Line item IDs expected to be touched by the bulk request. Required when DV360 line item, insertion order or campaign allowlists are configured and IDs cannot be inferred from the request body."),
         request: jsonObject,
         ...mutationControls
       })
     },
     async ({ advertiserId, lineItemId, lineItemIds, request, dryRun, confirm }) =>
       safeRun(async () => {
-        assertBulkLineItemAllowlist(
+        const scope = await resolveBulkLineItemScope(
+          dv360Client,
           config,
+          advertiserId,
           lineItemId ? [lineItemId, ...(lineItemIds ?? [])] : lineItemIds,
           request
         );
@@ -398,6 +467,7 @@ function registerDv360WriteTools(server: McpServer, { dv360Client, config }: Dv3
           config,
           product: "dv360",
           toolName: "dv360_bulk_edit_line_item_targeting",
+          partnerId: scope.partnerId,
           advertiserId,
           lineItemId,
           dryRun,
@@ -412,7 +482,7 @@ function registerDv360WriteTools(server: McpServer, { dv360Client, config }: Dv3
   );
 }
 
-function registerBidManagerTools(server: McpServer, { bidManagerClient, config }: Dv360ToolContext): void {
+function registerBidManagerQueryTools(server: McpServer, { bidManagerClient, config }: BidManagerToolContext): void {
   server.registerTool(
     "bidmanager_list_queries",
     {
@@ -529,25 +599,26 @@ function registerBidManagerTools(server: McpServer, { bidManagerClient, config }
   );
 
   server.registerTool(
-    "bidmanager_download_report_url",
+    "bidmanager_download_report",
     {
-      description: "Download a generated Bid Manager report from a URL returned by the reporting API.",
+      description:
+        "Download a finished Bid Manager report to the local download directory and return a small text preview. The file location comes from the report's own metadata.",
       inputSchema: z.object({
-        url: z.url(),
-        queryId: idString.optional().describe("Bid Manager query ID associated with the report URL. Required when BID_MANAGER_ALLOWED_QUERY_IDS is configured."),
-        fileName: z.string().min(1),
+        queryId: idString,
+        reportId: idString,
+        fileName: z.string().min(1).optional(),
         maxPreviewBytes: z.number().int().positive().max(65536).optional().default(4096)
       })
     },
-    async ({ url, queryId, fileName, maxPreviewBytes }) =>
+    async ({ queryId, reportId, fileName, maxPreviewBytes }) =>
       safeRun(async () => {
-        assertEntityIdsAllowed("Bid Manager query", queryId ? [queryId] : undefined, config.allowedBidManagerQueryIds, {
-          requireWhenAllowlisted: true
-        });
+        assertEntityAllowed("Bid Manager query", queryId, config.allowedBidManagerQueryIds);
+        const report = await bidManagerClient.request({ method: "GET", path: `/queries/${queryId}/reports/${reportId}` });
+        const file = reportFileLocation(report, queryId, reportId);
         return jsonResult(
-          await bidManagerClient.downloadFromUrl({
-            url,
-            fileName,
+          await bidManagerClient.downloadSignedFile({
+            url: file.url,
+            fileName: fileName ?? `bidmanager-report-${queryId}-${reportId}${file.extension}`,
             maxPreviewBytes
           })
         );
@@ -555,22 +626,7 @@ function registerBidManagerTools(server: McpServer, { bidManagerClient, config }
   );
 }
 
-function registerDv360RawTools(server: McpServer, { dv360Client, bidManagerClient, config }: Dv360ToolContext): void {
-  const rawInput = z.object({
-    method: z.enum(["GET", "POST", "PATCH", "PUT", "DELETE"]),
-    path: z.string().min(1),
-    query: querySchema,
-    body: z.unknown().optional(),
-    partnerId: idString.optional(),
-    advertiserId: idString.optional(),
-    campaignId: idString.optional(),
-    insertionOrderId: idString.optional(),
-    lineItemId: idString.optional(),
-    queryId: idString.optional(),
-    dryRun: dryRunSchema,
-    confirm: confirmSchema
-  });
-
+function registerDv360RawTool(server: McpServer, { dv360Client, config }: Dv360ToolContext): void {
   server.registerTool(
     "dv360_api_request",
     {
@@ -593,7 +649,9 @@ function registerDv360RawTools(server: McpServer, { dv360Client, bidManagerClien
         request: { method, path, query, body }
       })
   );
+}
 
+function registerBidManagerRawTool(server: McpServer, { bidManagerClient, config }: BidManagerToolContext): void {
   server.registerTool(
     "bidmanager_api_request",
     {
@@ -621,11 +679,11 @@ function registerDv360RawTools(server: McpServer, { dv360Client, bidManagerClien
 
 function registerAdvertiserResource(
   server: McpServer,
-  { dv360Client, config }: Pick<Dv360ToolContext, "dv360Client" | "config">,
+  { dv360Client, config }: Dv360ToolContext,
   options: {
     listTool: string;
     getTool: string;
-    resource: string;
+    resource: Dv360Resource;
     singular: string;
     idName: string;
     idAllowlistName?: "campaignId" | "insertionOrderId" | "lineItemId";
@@ -639,8 +697,9 @@ function registerAdvertiserResource(
     },
     async ({ advertiserId, query }) =>
       safeRun(async () => {
-        assertDv360BroadResourceListAllowed(config, options.idAllowlistName, options.singular);
+        assertDv360BroadResourceListAllowed(config, options.resource, options.singular);
         assertAllowedEntities(config, { product: "dv360", toolName: options.listTool, advertiserId, request: { method: "GET", path: `/advertisers/${advertiserId}/${options.resource}` } });
+        await resolveDv360AdvertiserScope(dv360Client, config, advertiserId);
         return jsonResult(await dv360Client.request({ method: "GET", path: `/advertisers/${advertiserId}/${options.resource}`, query }));
       })
   );
@@ -658,30 +717,27 @@ function registerAdvertiserResource(
       safeRun(async () => {
         const advertiserId = input.advertiserId;
         const resourceId = String(input[options.idName]);
+        const path = `/advertisers/${advertiserId}/${options.resource}/${resourceId}`;
         assertAllowedEntities(config, {
           product: "dv360",
           toolName: options.getTool,
           advertiserId,
           ...allowlistEntity(options.idAllowlistName, resourceId),
-          request: { method: "GET", path: `/advertisers/${advertiserId}/${options.resource}/${resourceId}` }
+          request: { method: "GET", path }
         });
-        return jsonResult(
-          await dv360Client.request({
-            method: "GET",
-            path: `/advertisers/${advertiserId}/${options.resource}/${resourceId}`
-          })
-        );
+        const scope = await resolveDv360ObjectScope(dv360Client, config, options.resource, advertiserId, resourceId);
+        return jsonResult(scope.object ?? (await dv360Client.request({ method: "GET", path })));
       })
   );
 }
 
 function registerCreateAndPatch(
   server: McpServer,
-  { dv360Client, config }: Pick<Dv360ToolContext, "dv360Client" | "config">,
+  { dv360Client, config }: Dv360ToolContext,
   options: {
     createTool: string;
     patchTool: string;
-    resource: string;
+    resource: Dv360Resource;
     bodyName: string;
     idName: string;
     idAllowlistName?: "campaignId" | "insertionOrderId" | "lineItemId";
@@ -700,14 +756,18 @@ function registerCreateAndPatch(
     async ({ advertiserId, resource, dryRun, confirm }) =>
       safeRun(async () => {
         assertDv360CreateAllowed(config, options.idAllowlistName, options.bodyName);
+        assertEntityAllowed("DV360 advertiser", advertiserId, config.allowedDv360AdvertiserIds);
+        const { partnerId } = await resolveDv360AdvertiserScope(dv360Client, config, advertiserId);
+        const parents = await resolveCreateParents(dv360Client, config, options.resource, advertiserId, resource);
         return runGuardedGoogleRequest({
           client: dv360Client,
           config,
           product: "dv360",
           toolName: options.createTool,
+          partnerId,
           advertiserId,
-          campaignId: stringField(resource, "campaignId"),
-          insertionOrderId: stringField(resource, "insertionOrderId"),
+          campaignId: parents.campaignId,
+          insertionOrderId: parents.insertionOrderId,
           lineItemId: stringField(resource, "lineItemId"),
           dryRun,
           confirm,
@@ -732,36 +792,289 @@ function registerCreateAndPatch(
         ...mutationControls
       })
     },
-    async (input) => {
-      const indexedInput = input as Record<string, unknown> & typeof input;
-      const advertiserId = input.advertiserId;
-      const resourceId = String(indexedInput[options.idName]);
-      const patch = input.patch as Record<string, unknown>;
-      return runGuardedGoogleRequest({
-        client: dv360Client,
-        config,
-        product: "dv360",
-        toolName: options.patchTool,
-        advertiserId,
-        ...allowlistEntity(options.idAllowlistName, resourceId),
-        campaignId: stringField(patch, "campaignId") ?? allowlistEntity(options.idAllowlistName, resourceId).campaignId,
-        insertionOrderId:
-          stringField(patch, "insertionOrderId") ?? allowlistEntity(options.idAllowlistName, resourceId).insertionOrderId,
-        lineItemId: stringField(patch, "lineItemId") ?? allowlistEntity(options.idAllowlistName, resourceId).lineItemId,
-        dryRun: input.dryRun,
-        confirm: input.confirm,
-        request: {
-          method: "PATCH",
+    async (input) =>
+      safeRun(async () => {
+        const indexedInput = input as Record<string, unknown> & typeof input;
+        const advertiserId = input.advertiserId;
+        const resourceId = String(indexedInput[options.idName]);
+        const patch = input.patch as Record<string, unknown>;
+        const declared = allowlistEntity(options.idAllowlistName, resourceId);
+        const request = {
+          method: "PATCH" as const,
           path: `/advertisers/${advertiserId}/${options.resource}/${resourceId}`,
           query: { updateMask: input.updateMask },
           body: patch
-        }
-      });
-    }
+        };
+        assertAllowedEntities(config, { product: "dv360", toolName: options.patchTool, advertiserId, ...declared, request });
+        const scope = await resolveDv360ObjectScope(dv360Client, config, options.resource, advertiserId, resourceId);
+        return runGuardedGoogleRequest({
+          client: dv360Client,
+          config,
+          product: "dv360",
+          toolName: options.patchTool,
+          partnerId: scope.partnerId,
+          advertiserId,
+          campaignId: stringField(patch, "campaignId") ?? declared.campaignId ?? scope.campaignId,
+          insertionOrderId: stringField(patch, "insertionOrderId") ?? declared.insertionOrderId ?? scope.insertionOrderId,
+          lineItemId: stringField(patch, "lineItemId") ?? declared.lineItemId,
+          dryRun: input.dryRun,
+          confirm: input.confirm,
+          request
+        });
+      })
   );
 }
 
-function allowlistEntity(idName: "campaignId" | "insertionOrderId" | "lineItemId" | undefined, id: string) {
+interface Dv360Scope {
+  partnerId?: string;
+  campaignId?: string;
+  insertionOrderId?: string;
+  object?: Record<string, unknown>;
+}
+
+// Allowlists for a parent (partner, campaign, insertion order) are checked against the owner that
+// Google reports for the target object, never against IDs supplied by the caller.
+async function resolveDv360AdvertiserScope(
+  client: GoogleApiClient,
+  config: ServerConfig,
+  advertiserId: string
+): Promise<Dv360Scope> {
+  if (config.allowedDv360PartnerIds.size === 0) {
+    return {};
+  }
+
+  const advertiser = await fetchDv360Object(client, `/advertisers/${advertiserId}`, `DV360 advertiser ${advertiserId}`);
+  const partnerId = requiredOwnerId(advertiser, "partnerId", `DV360 advertiser ${advertiserId}`);
+  assertEntityAllowed("DV360 partner", partnerId, config.allowedDv360PartnerIds);
+  return { partnerId, object: advertiser };
+}
+
+async function resolveDv360ObjectScope(
+  client: GoogleApiClient,
+  config: ServerConfig,
+  resource: Dv360Resource,
+  advertiserId: string,
+  resourceId: string
+): Promise<Dv360Scope> {
+  const { partnerId } = await resolveDv360AdvertiserScope(client, config, advertiserId);
+
+  if (resource === "insertionOrders") {
+    return { partnerId, ...(await resolveInsertionOrderOwner(client, config, advertiserId, resourceId)) };
+  }
+
+  if (resource === "lineItems") {
+    return { partnerId, ...(await resolveLineItemOwners(client, config, advertiserId, resourceId)) };
+  }
+
+  return { partnerId };
+}
+
+async function resolveInsertionOrderOwner(
+  client: GoogleApiClient,
+  config: ServerConfig,
+  advertiserId: string,
+  insertionOrderId: string
+): Promise<Dv360Scope> {
+  if (config.allowedDv360CampaignIds.size === 0) {
+    return {};
+  }
+
+  const label = `DV360 insertion order ${insertionOrderId}`;
+  const insertionOrder = await fetchDv360Object(
+    client,
+    `/advertisers/${advertiserId}/insertionOrders/${insertionOrderId}`,
+    label
+  );
+  const campaignId = requiredOwnerId(insertionOrder, "campaignId", label);
+  assertEntityAllowed("DV360 campaign", campaignId, config.allowedDv360CampaignIds);
+  return { campaignId, object: insertionOrder };
+}
+
+async function resolveLineItemOwners(
+  client: GoogleApiClient,
+  config: ServerConfig,
+  advertiserId: string,
+  lineItemId: string
+): Promise<Dv360Scope> {
+  const checkInsertionOrder = config.allowedDv360InsertionOrderIds.size > 0;
+  const checkCampaign = config.allowedDv360CampaignIds.size > 0;
+  if (!checkInsertionOrder && !checkCampaign) {
+    return {};
+  }
+
+  const label = `DV360 line item ${lineItemId}`;
+  const lineItem = await fetchDv360Object(client, `/advertisers/${advertiserId}/lineItems/${lineItemId}`, label);
+  const scope: Dv360Scope = { object: lineItem };
+
+  if (checkInsertionOrder) {
+    scope.insertionOrderId = requiredOwnerId(lineItem, "insertionOrderId", label);
+    assertEntityAllowed("DV360 insertion order", scope.insertionOrderId, config.allowedDv360InsertionOrderIds);
+  }
+
+  if (checkCampaign) {
+    scope.campaignId = requiredOwnerId(lineItem, "campaignId", label);
+    assertEntityAllowed("DV360 campaign", scope.campaignId, config.allowedDv360CampaignIds);
+  }
+
+  return scope;
+}
+
+async function verifyLineItemOwners(
+  client: GoogleApiClient,
+  config: ServerConfig,
+  advertiserId: string,
+  lineItemIds: readonly string[]
+): Promise<void> {
+  if (config.allowedDv360InsertionOrderIds.size === 0 && config.allowedDv360CampaignIds.size === 0) {
+    return;
+  }
+
+  if (lineItemIds.length === 0) {
+    throw new SafetyError(
+      "Line item IDs are required when DV360 campaign or insertion order allowlists are configured, so each line item's owner can be checked."
+    );
+  }
+
+  if (lineItemIds.length > maxVerifiedLineItems) {
+    throw new SafetyError(
+      `This request touches ${lineItemIds.length} line items. With DV360 campaign or insertion order allowlists configured, split it into batches of ${maxVerifiedLineItems} or fewer so each owner can be checked.`
+    );
+  }
+
+  for (const lineItemId of lineItemIds) {
+    await resolveLineItemOwners(client, config, advertiserId, lineItemId);
+  }
+}
+
+async function resolveBulkLineItemScope(
+  client: GoogleApiClient,
+  config: ServerConfig,
+  advertiserId: string,
+  explicitLineItemIds: readonly string[] | undefined,
+  request: unknown
+): Promise<Dv360Scope> {
+  const lineItemIds = [...new Set([...(explicitLineItemIds ?? []), ...collectLineItemIds(request)])];
+  assertEntityIdsAllowed("DV360 line item", lineItemIds, config.allowedDv360LineItemIds, {
+    requireWhenAllowlisted: true
+  });
+  assertEntityAllowed("DV360 advertiser", advertiserId, config.allowedDv360AdvertiserIds);
+  const scope = await resolveDv360AdvertiserScope(client, config, advertiserId);
+  await verifyLineItemOwners(client, config, advertiserId, lineItemIds);
+  return { partnerId: scope.partnerId };
+}
+
+async function resolveCreateParents(
+  client: GoogleApiClient,
+  config: ServerConfig,
+  resource: Dv360Resource,
+  advertiserId: string,
+  body: Record<string, unknown>
+): Promise<Dv360Scope> {
+  const campaignId = stringField(body, "campaignId");
+  const insertionOrderId = stringField(body, "insertionOrderId");
+
+  if (resource === "insertionOrders") {
+    assertEntityIdsAllowed("DV360 campaign", campaignId ? [campaignId] : undefined, config.allowedDv360CampaignIds, {
+      requireWhenAllowlisted: true
+    });
+    return { campaignId };
+  }
+
+  if (resource === "lineItems") {
+    const parentAllowlisted =
+      config.allowedDv360InsertionOrderIds.size > 0 || config.allowedDv360CampaignIds.size > 0;
+    if (!insertionOrderId && parentAllowlisted) {
+      throw new SafetyError(
+        "lineItem.insertionOrderId is required when DV360 campaign or insertion order allowlists are configured."
+      );
+    }
+    if (!insertionOrderId) {
+      return { campaignId };
+    }
+
+    assertEntityAllowed("DV360 insertion order", insertionOrderId, config.allowedDv360InsertionOrderIds);
+    const owner = await resolveInsertionOrderOwner(client, config, advertiserId, insertionOrderId);
+    return { insertionOrderId, campaignId: owner.campaignId ?? campaignId };
+  }
+
+  return { campaignId, insertionOrderId };
+}
+
+async function fetchDv360Object(
+  client: GoogleApiClient,
+  path: string,
+  label: string
+): Promise<Record<string, unknown>> {
+  const value = await client.request({ method: "GET", path });
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new SafetyError(`${label} response was not a JSON object, so its owner could not be checked.`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function requiredOwnerId(object: Record<string, unknown>, field: string, label: string): string {
+  const value = stringField(object, field);
+  if (!value) {
+    throw new SafetyError(`${label} did not expose ${field}, so its allowlist could not be checked.`);
+  }
+  return value;
+}
+
+function reportFileLocation(
+  report: unknown,
+  queryId: string,
+  reportId: string
+): { url: string; extension: string } {
+  const metadata = objectField(report, "metadata");
+  const status = objectField(metadata, "status");
+  const url = metadata ? stringField(metadata, "googleCloudStoragePath") : undefined;
+
+  if (!url) {
+    const state = status ? stringField(status, "state") : undefined;
+    throw new Error(
+      `Bid Manager report ${reportId} for query ${queryId} has no file to download yet (state: ${state ?? "unknown"}). Poll bidmanager_get_report until the state is DONE.`
+    );
+  }
+
+  const format = status ? stringField(status, "format") : undefined;
+  const extension = format === "CSV" ? ".csv" : format === "XLSX" ? ".xlsx" : "";
+  return { url, extension };
+}
+
+function objectField(value: unknown, key: string): Record<string, unknown> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+
+  const field = (value as Record<string, unknown>)[key];
+  return field && typeof field === "object" && !Array.isArray(field)
+    ? (field as Record<string, unknown>)
+    : undefined;
+}
+
+// Google REST APIs also accept snake_case query names (partner_id for partnerId). A checked field
+// must arrive under its exact name, or an alias could carry an ID past the check.
+function assertNoQueryAliases(query: Record<string, unknown> | undefined, checkedFields: readonly string[]): void {
+  const normalise = (name: string) => name.replace(/_/g, "").toLowerCase();
+  for (const key of Object.keys(query ?? {})) {
+    const field = checkedFields.find((checked) => key !== checked && normalise(key) === normalise(checked));
+    if (field) {
+      throw new SafetyError(`Pass ${field} under its exact name, not as query.${key}, so it can be checked.`);
+    }
+  }
+}
+
+function queryValues(value: unknown): string[] | undefined {
+  const values = (Array.isArray(value) ? value : [value])
+    .filter((item) => typeof item === "string" || typeof item === "number" || typeof item === "boolean")
+    .map(String);
+  return values.length > 0 ? values : undefined;
+}
+
+function allowlistEntity(
+  idName: "campaignId" | "insertionOrderId" | "lineItemId" | undefined,
+  id: string
+): { campaignId?: string; insertionOrderId?: string; lineItemId?: string } {
   if (idName === "campaignId") {
     return { campaignId: id };
   }
@@ -813,23 +1126,26 @@ function assertRequiredId(name: string, value: string | undefined): asserts valu
   }
 }
 
+// A list call can only be scoped by advertiser, so it is blocked while the resource itself or any of
+// its parents has an allowlist.
 function assertDv360BroadResourceListAllowed(
   config: ServerConfig,
-  idAllowlistName: "campaignId" | "insertionOrderId" | "lineItemId" | undefined,
+  resource: Dv360Resource,
   singular: string
 ): void {
-  if (idAllowlistName === "campaignId") {
-    assertBroadListAllowed(`DV360 ${singular}`, config.allowedDv360CampaignIds);
-    return;
-  }
+  const guardingAllowlists: Record<Dv360Resource, Array<Set<string>>> = {
+    campaigns: [config.allowedDv360CampaignIds],
+    insertionOrders: [config.allowedDv360CampaignIds, config.allowedDv360InsertionOrderIds],
+    lineItems: [
+      config.allowedDv360CampaignIds,
+      config.allowedDv360InsertionOrderIds,
+      config.allowedDv360LineItemIds
+    ],
+    creatives: []
+  };
 
-  if (idAllowlistName === "insertionOrderId") {
-    assertBroadListAllowed(`DV360 ${singular}`, config.allowedDv360InsertionOrderIds);
-    return;
-  }
-
-  if (idAllowlistName === "lineItemId") {
-    assertBroadListAllowed(`DV360 ${singular}`, config.allowedDv360LineItemIds);
+  for (const allowlist of guardingAllowlists[resource]) {
+    assertBroadListAllowed(`DV360 ${singular}`, allowlist);
   }
 }
 
@@ -847,28 +1163,10 @@ function assertDv360CreateAllowed(
         : new Set<string>();
 
   if (allowlist.size > 0) {
-    throw new Error(
+    throw new SafetyError(
       `Creating a new DV360 ${resourceName} is blocked while its ID allowlist is configured because the new ID is not known in advance.`
     );
   }
-}
-
-function assertBulkLineItemAllowlist(
-  config: ServerConfig,
-  explicitLineItemIds: readonly string[] | undefined,
-  request: unknown
-): void {
-  const lineItemIds = new Set([
-    ...(explicitLineItemIds ?? []),
-    ...collectLineItemIds(request)
-  ]);
-
-  assertEntityIdsAllowed(
-    "DV360 line item",
-    [...lineItemIds],
-    config.allowedDv360LineItemIds,
-    { requireWhenAllowlisted: true }
-  );
 }
 
 function collectLineItemIds(value: unknown): string[] {
