@@ -70,7 +70,7 @@ export async function guardMutation(
   const previewFingerprint = mutationFingerprint(product, input.toolName, input.request);
 
   if (dryRun) {
-    await auditMutation(config, input, "dry_run");
+    await auditBeforeRequest(config, input, "dry_run");
     const expiresAt = Date.now() + previewTtlMs;
     rememberPreview(previewFingerprint, expiresAt);
     return {
@@ -95,8 +95,23 @@ export async function guardMutation(
   }
 
   consumePreview(previewFingerprint);
-  await auditMutation(config, input, "live_requested");
+  await auditBeforeRequest(config, input, "live_requested");
   return { dryRun: false };
+}
+
+async function auditBeforeRequest(
+  config: ServerConfig,
+  input: MutationGuardInput,
+  event: "dry_run" | "live_requested"
+): Promise<void> {
+  try {
+    await auditMutation(config, input, event);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new SafetyError(
+      `Write blocked because the audit log at ${config.auditLogPath} could not be written (${detail}). Set GMP_AUDIT_LOG_PATH to a writable absolute path.`
+    );
+  }
 }
 
 function mutationFingerprint(
@@ -339,6 +354,12 @@ function assertRawPathEntityAllowed(
 }
 
 function rawRequestPath(requestPath: string): string {
+  if (/[?#]/.test(requestPath)) {
+    throw new SafetyError(
+      "Raw request paths must not contain a query string or fragment. Pass query parameters in `query` so they can be checked."
+    );
+  }
+
   try {
     return new URL(requestPath, "https://mcp.invalid").pathname;
   } catch {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import type { ServerConfig } from "./config.js";
+import { ALL_GMP_PRODUCTS, type ServerConfig } from "./config.js";
 import {
   assertAllowedEntities,
   assertEntityAllowed,
@@ -91,6 +91,16 @@ describe("product safety", () => {
         request: { method: "GET", path: "/accountSummaries" }
       })
     ).toThrow(/cannot be verified/);
+  });
+
+  it("rejects raw paths that hide a query string from the allowlist check", () => {
+    expect(() =>
+      assertRawRequestAllowedEntities(testConfig(), {
+        product: "cm360",
+        toolName: "cm360_api_request",
+        request: { method: "PATCH", path: "/userprofiles/1/campaigns?id=2", query: { id: "3" } }
+      })
+    ).toThrow(/must not contain a query string/);
   });
 
   it("requires bulk IDs when a bulk allowlist is configured", () => {
@@ -206,6 +216,18 @@ describe("mutation previews", () => {
   });
 });
 
+describe("audit failures", () => {
+  it("blocks a write with a message that says how to fix the audit path", async () => {
+    await expect(
+      guardMutation(testConfig({ auditLogPath: "/dev/null/audit.log" }), {
+        toolName: "test_unwritable_audit",
+        request: { method: "POST", path: "/userprofiles/1/campaigns", body: {} },
+        dryRun: true
+      })
+    ).rejects.toThrow(/Set GMP_AUDIT_LOG_PATH to a writable absolute path/);
+  });
+});
+
 describe("audit redaction", () => {
   it("redacts sensitive fields before audit logging", () => {
     const redacted = redactForAudit({
@@ -257,6 +279,7 @@ function testConfig(overrides: Partial<ServerConfig> = {}): ServerConfig {
     sa360ApiBaseUrl: "https://searchads360.googleapis.com/v0",
     sa360LegacyApiBaseUrl: "https://www.googleapis.com/doubleclicksearch/v2",
     scopes: [],
+    enabledProducts: new Set(ALL_GMP_PRODUCTS),
     authMode: "auto",
     writesEnabled: false,
     rawRequestEnabled: false,

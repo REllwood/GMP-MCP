@@ -2,9 +2,10 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 
+import { withToolAnnotations } from "./annotations.js";
 import { createAuthClient } from "./auth.js";
 import { Cm360Client } from "./cm360Client.js";
-import { registerDv360Tools } from "./dv360Tools.js";
+import { registerBidManagerTools, registerDv360Tools } from "./dv360Tools.js";
 import { registerGa4Tools } from "./ga4Tools.js";
 import { GoogleApiClient } from "./googleApiClient.js";
 import { registerGtmTools } from "./gtmTools.js";
@@ -46,30 +47,48 @@ async function main(): Promise<void> {
     }
   );
 
-  registerCm360Tools(server, {
-    client: cm360Client,
-    config
-  });
-  registerDv360Tools(server, {
-    dv360Client,
-    bidManagerClient,
-    config
-  });
-  registerGa4Tools(server, {
-    adminClient: ga4AdminClient,
-    adminAlphaClient: ga4AdminAlphaClient,
-    dataClient: ga4DataClient,
-    config
-  });
-  registerGtmTools(server, {
-    client: gtmClient,
-    config
-  });
-  registerSa360Tools(server, {
-    reportingClient: sa360Client,
-    legacyClient: sa360LegacyClient,
-    config
-  });
+  const tools = withToolAnnotations(server);
+  const products = config.enabledProducts;
+
+  if (products.has("cm360")) {
+    registerCm360Tools(tools, {
+      client: cm360Client,
+      config
+    });
+  }
+  if (products.has("dv360")) {
+    registerDv360Tools(tools, {
+      dv360Client,
+      config
+    });
+  }
+  if (products.has("bidManager")) {
+    registerBidManagerTools(tools, {
+      bidManagerClient,
+      config
+    });
+  }
+  if (products.has("ga4")) {
+    registerGa4Tools(tools, {
+      adminClient: ga4AdminClient,
+      adminAlphaClient: ga4AdminAlphaClient,
+      dataClient: ga4DataClient,
+      config
+    });
+  }
+  if (products.has("gtm")) {
+    registerGtmTools(tools, {
+      client: gtmClient,
+      config
+    });
+  }
+  if (products.has("sa360")) {
+    registerSa360Tools(tools, {
+      reportingClient: sa360Client,
+      legacyClient: sa360LegacyClient,
+      config
+    });
+  }
 
   const transport = new StdioServerTransport();
   await server.connect(transport);

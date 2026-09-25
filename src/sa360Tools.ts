@@ -5,8 +5,8 @@ import type { ServerConfig } from "./config.js";
 import type { GoogleApiClient } from "./googleApiClient.js";
 import { jsonResult } from "./response.js";
 import { confirmSchema, dryRunSchema, idString, jsonObject, mutationControls, querySchema } from "./schemas.js";
-import { assertAllowedEntities } from "./safety.js";
-import { runGuardedGoogleRequest, runRawGoogleRequest, safeRun } from "./toolHelpers.js";
+import { assertAllowedEntities, SafetyError } from "./safety.js";
+import { runGuardedGoogleRequest, runRawGoogleRequest, safeRun, stringField } from "./toolHelpers.js";
 
 interface Sa360ToolContext {
   reportingClient: GoogleApiClient;
@@ -175,25 +175,28 @@ function registerSa360ConversionTools(server: McpServer, { legacyClient, config 
     {
       description: "Insert offline or online conversions through the legacy Search Ads 360 Conversion API.",
       inputSchema: z.object({
-        customerId: idString.describe("SA360 customer ID used for allowlist checks and audit attribution."),
+        customerId: idString.describe("SA360 client customer ID. Every conversion in the request must set this same customerId."),
         request: jsonObject,
         ...mutationControls
       })
     },
     async ({ customerId, request, dryRun, confirm }) =>
-      runGuardedGoogleRequest({
-        client: legacyClient,
-        config,
-        product: "sa360",
-        toolName: "sa360_insert_conversions",
-        sa360CustomerId: customerId,
-        dryRun,
-        confirm,
-        request: {
-          method: "POST",
-          path: "/conversion",
-          body: request
-        }
+      safeRun(async () => {
+        assertConversionTargets(config, customerId, request);
+        return runGuardedGoogleRequest({
+          client: legacyClient,
+          config,
+          product: "sa360",
+          toolName: "sa360_insert_conversions",
+          sa360CustomerId: customerId,
+          dryRun,
+          confirm,
+          request: {
+            method: "POST",
+            path: "/conversion",
+            body: request
+          }
+        });
       })
   );
 
@@ -202,25 +205,28 @@ function registerSa360ConversionTools(server: McpServer, { legacyClient, config 
     {
       description: "Update conversions through the legacy Search Ads 360 Conversion API.",
       inputSchema: z.object({
-        customerId: idString.describe("SA360 customer ID used for allowlist checks and audit attribution."),
+        customerId: idString.describe("SA360 client customer ID. Every conversion in the request must set this same customerId."),
         request: jsonObject,
         ...mutationControls
       })
     },
     async ({ customerId, request, dryRun, confirm }) =>
-      runGuardedGoogleRequest({
-        client: legacyClient,
-        config,
-        product: "sa360",
-        toolName: "sa360_update_conversions",
-        sa360CustomerId: customerId,
-        dryRun,
-        confirm,
-        request: {
-          method: "PUT",
-          path: "/conversion",
-          body: request
-        }
+      safeRun(async () => {
+        assertConversionTargets(config, customerId, request);
+        return runGuardedGoogleRequest({
+          client: legacyClient,
+          config,
+          product: "sa360",
+          toolName: "sa360_update_conversions",
+          sa360CustomerId: customerId,
+          dryRun,
+          confirm,
+          request: {
+            method: "PUT",
+            path: "/conversion",
+            body: request
+          }
+        });
       })
   );
 }
@@ -253,4 +259,46 @@ function registerSa360RawTools(server: McpServer, { reportingClient, legacyClien
         request: { method, path, query, body }
       })
   );
+}
+
+// The legacy Conversion API takes its targets from the request body, so the declared customerId only
+// counts once every conversion is shown to target that same customer.
+function assertConversionTargets(
+  config: ServerConfig,
+  customerId: string,
+  request: Record<string, unknown>
+): void {
+  const allowlisted = config.allowedSa360CustomerIds.size > 0;
+  const conversions = request.conversion;
+
+  if (!Array.isArray(conversions) || conversions.length === 0) {
+    if (allowlisted) {
+      throw new SafetyError(
+        "request.conversion must be a non-empty array so each conversion's customerId can be checked against SA360_ALLOWED_CUSTOMER_IDS."
+      );
+    }
+    return;
+  }
+
+  conversions.forEach((conversion, index) => {
+    const target =
+      conversion && typeof conversion === "object" && !Array.isArray(conversion)
+        ? stringField(conversion as Record<string, unknown>, "customerId")
+        : undefined;
+
+    if (!target) {
+      if (allowlisted) {
+        throw new SafetyError(
+          `conversion[${index}] has no customerId, so SA360_ALLOWED_CUSTOMER_IDS cannot be checked. Set customerId on every conversion.`
+        );
+      }
+      return;
+    }
+
+    if (target !== customerId) {
+      throw new SafetyError(
+        `conversion[${index}] targets SA360 customer ${target}, but this call declared customer ${customerId}. Send one customer per request.`
+      );
+    }
+  });
 }

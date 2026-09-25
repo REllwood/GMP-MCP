@@ -4,7 +4,7 @@ import path from "node:path";
 import { getAccessToken, type AccessTokenProvider } from "./auth.js";
 import type { HttpMethod, QueryParams } from "./cm360Client.js";
 import type { ServerConfig } from "./config.js";
-import { readResponseBytes } from "./http.js";
+import { assertPathHasNoQuery, readResponseBytes, retryDelayMs } from "./http.js";
 
 export interface GoogleApiRequestOptions {
   method: HttpMethod;
@@ -42,12 +42,8 @@ const retryableStatuses = new Set([429, 500, 502, 503, 504]);
 const retryableMethods = new Set<HttpMethod>(["GET", "PUT", "DELETE"]);
 const maxErrorPreviewBytes = 65_536;
 
-const trustedDownloadHostSuffixes = [".googleapis.com"];
-const trustedDownloadHosts = new Set([
-  "googleapis.com",
-  "storage.googleapis.com",
-  "www.googleapis.com"
-]);
+// Report files are served from signed Cloud Storage URLs. They need no OAuth token, so none is sent.
+const trustedDownloadHosts = new Set(["storage.googleapis.com"]);
 
 export class GoogleApiClient {
   private nextRequestAt = 0;
@@ -80,7 +76,7 @@ export class GoogleApiClient {
     return this.writeDownload(bytes, args.fileName, args.maxPreviewBytes);
   }
 
-  public async downloadFromUrl(args: {
+  public async downloadSignedFile(args: {
     url: string;
     fileName: string;
     maxPreviewBytes?: number;
@@ -88,16 +84,21 @@ export class GoogleApiClient {
     const url = new URL(args.url);
     assertTrustedDownloadUrl(url);
 
-    const bytes = await this.fetchUrl<ArrayBuffer>(url, {
-      method: "GET",
-      path: args.url,
-      responseType: "bytes"
-    });
+    const bytes = await this.fetchUrl<ArrayBuffer>(
+      url,
+      {
+        method: "GET",
+        path: args.url,
+        responseType: "bytes"
+      },
+      { authenticate: false }
+    );
 
     return this.writeDownload(bytes, args.fileName, args.maxPreviewBytes);
   }
 
   public buildUrl(requestPath: string, query: QueryParams = {}): URL {
+    assertPathHasNoQuery(requestPath);
     const base = this.baseUrl.endsWith("/") ? this.baseUrl.slice(0, -1) : this.baseUrl;
     const baseUrl = new URL(base);
     const normalisedPath = stripBasePath(normaliseApiPath(requestPath), baseUrl.pathname);
@@ -117,11 +118,15 @@ export class GoogleApiClient {
     return url;
   }
 
-  private async fetchUrl<T>(url: URL, options: GoogleApiRequestOptions): Promise<T> {
-    const token = await getAccessToken(this.authClient);
-    const headers = new Headers({
-      Authorization: `Bearer ${token}`
-    });
+  private async fetchUrl<T>(
+    url: URL,
+    options: GoogleApiRequestOptions,
+    { authenticate = true }: { authenticate?: boolean } = {}
+  ): Promise<T> {
+    const headers = new Headers();
+    if (authenticate) {
+      headers.set("Authorization", `Bearer ${await getAccessToken(this.authClient)}`);
+    }
 
     let body: BodyInit | undefined;
     if (options.body !== undefined) {
@@ -157,7 +162,7 @@ export class GoogleApiClient {
         });
       }
 
-      await sleep(backoffMs(attempt, response));
+      await sleep(retryDelayMs(attempt, response.headers.get("retry-after")));
     }
 
     throw new Error(`${this.serviceName} API request exited retry loop unexpectedly.`);
@@ -257,12 +262,7 @@ export function assertTrustedDownloadUrl(url: URL): void {
     throw new Error("Report download URLs must use HTTPS.");
   }
 
-  const hostname = url.hostname.toLowerCase();
-  const isTrustedHost =
-    trustedDownloadHosts.has(hostname) ||
-    trustedDownloadHostSuffixes.some((suffix) => hostname.endsWith(suffix));
-
-  if (!isTrustedHost) {
+  if (!trustedDownloadHosts.has(url.hostname.toLowerCase())) {
     throw new Error("Report download URL must point to a trusted Google download host.");
   }
 }
@@ -278,18 +278,6 @@ async function safeReadResponseText(response: Response): Promise<string> {
   } catch {
     return "";
   }
-}
-
-function backoffMs(attempt: number, response: Response): number {
-  const retryAfter = response.headers.get("retry-after");
-  if (retryAfter) {
-    const seconds = Number(retryAfter);
-    if (Number.isFinite(seconds) && seconds > 0) {
-      return seconds * 1000;
-    }
-  }
-
-  return Math.min(30_000, 1000 * 2 ** attempt);
 }
 
 function sleep(ms: number): Promise<void> {

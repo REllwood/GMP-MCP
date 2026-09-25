@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { Cm360Client } from "./cm360Client.js";
-import type { ServerConfig } from "./config.js";
+import { ALL_GMP_PRODUCTS, type ServerConfig } from "./config.js";
 import { GoogleApiClient } from "./googleApiClient.js";
 import { runGuardedGoogleRequest } from "./toolHelpers.js";
 
@@ -138,6 +138,7 @@ function testConfig(overrides: Partial<ServerConfig> = {}): ServerConfig {
     sa360ApiBaseUrl: "https://searchads360.googleapis.com/v0",
     sa360LegacyApiBaseUrl: "https://www.googleapis.com/doubleclicksearch/v2",
     scopes: [],
+    enabledProducts: new Set(ALL_GMP_PRODUCTS),
     authMode: "auto",
     writesEnabled: false,
     rawRequestEnabled: false,

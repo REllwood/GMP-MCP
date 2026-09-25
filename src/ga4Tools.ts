@@ -5,7 +5,7 @@ import type { ServerConfig } from "./config.js";
 import type { GoogleApiClient } from "./googleApiClient.js";
 import { jsonResult } from "./response.js";
 import { confirmSchema, dryRunSchema, idString, jsonObject, mutationControls, querySchema } from "./schemas.js";
-import { assertAllowedEntities, assertBroadListAllowed, SafetyError } from "./safety.js";
+import { assertAllowedEntities, assertBroadListAllowed, assertEntityAllowed, SafetyError } from "./safety.js";
 import { runGuardedGoogleRequest, runRawGoogleRequest, safeRun } from "./toolHelpers.js";
 
 interface Ga4ToolContext {
@@ -104,12 +104,14 @@ function registerGa4ReadTools(server: McpServer, { adminClient, adminAlphaClient
     },
     async ({ propertyId }) =>
       safeRun(async () => {
-        assertAllowedEntities(config, { product: "ga4", toolName: "ga4_get_property", ga4PropertyId: propertyId, request: { method: "GET", path: `/properties/${propertyId}` } });
-        return jsonResult(await adminClient.request({ method: "GET", path: `/properties/${propertyId}` }));
+        const scope = await resolveGa4PropertyScope(adminClient, config, propertyId);
+        return jsonResult(
+          scope.property ?? (await adminClient.request({ method: "GET", path: `/properties/${propertyId}` }))
+        );
       })
   );
 
-  registerPropertyResource(server, { adminClient, config }, {
+  registerPropertyResource(server, { client: adminClient, lookupClient: adminClient, config }, {
     listTool: "ga4_list_data_streams",
     getTool: "ga4_get_data_stream",
     resource: "dataStreams",
@@ -117,7 +119,7 @@ function registerGa4ReadTools(server: McpServer, { adminClient, adminAlphaClient
     singular: "data stream"
   });
 
-  registerPropertyResource(server, { adminClient, config }, {
+  registerPropertyResource(server, { client: adminClient, lookupClient: adminClient, config }, {
     listTool: "ga4_list_custom_dimensions",
     getTool: "ga4_get_custom_dimension",
     resource: "customDimensions",
@@ -125,7 +127,7 @@ function registerGa4ReadTools(server: McpServer, { adminClient, adminAlphaClient
     singular: "custom dimension"
   });
 
-  registerPropertyResource(server, { adminClient, config }, {
+  registerPropertyResource(server, { client: adminClient, lookupClient: adminClient, config }, {
     listTool: "ga4_list_custom_metrics",
     getTool: "ga4_get_custom_metric",
     resource: "customMetrics",
@@ -133,7 +135,7 @@ function registerGa4ReadTools(server: McpServer, { adminClient, adminAlphaClient
     singular: "custom metric"
   });
 
-  registerPropertyResource(server, { adminClient, config }, {
+  registerPropertyResource(server, { client: adminClient, lookupClient: adminClient, config }, {
     listTool: "ga4_list_key_events",
     getTool: "ga4_get_key_event",
     resource: "keyEvents",
@@ -141,7 +143,7 @@ function registerGa4ReadTools(server: McpServer, { adminClient, adminAlphaClient
     singular: "key event"
   });
 
-  registerPropertyResource(server, { adminClient, config }, {
+  registerPropertyResource(server, { client: adminClient, lookupClient: adminClient, config }, {
     listTool: "ga4_list_conversion_events",
     getTool: "ga4_get_conversion_event",
     resource: "conversionEvents",
@@ -150,7 +152,7 @@ function registerGa4ReadTools(server: McpServer, { adminClient, adminAlphaClient
     deprecatedAlternative: "Use GA4 key event tools for new integrations."
   });
 
-  registerPropertyResource(server, { adminClient: adminAlphaClient, config }, {
+  registerPropertyResource(server, { client: adminAlphaClient, lookupClient: adminClient, config }, {
     listTool: "ga4_list_audiences",
     getTool: "ga4_get_audience",
     resource: "audiences",
@@ -166,7 +168,7 @@ function registerGa4ReadTools(server: McpServer, { adminClient, adminAlphaClient
     },
     async ({ propertyId }) =>
       safeRun(async () => {
-        assertAllowedEntities(config, { product: "ga4", toolName: "ga4_get_metadata", ga4PropertyId: propertyId, request: { method: "GET", path: `/properties/${propertyId}/metadata` } });
+        await resolveGa4PropertyScope(adminClient, config, propertyId);
         return jsonResult(await dataClient.request({ method: "GET", path: `/properties/${propertyId}/metadata` }));
       })
   );
@@ -182,7 +184,7 @@ function registerGa4ReadTools(server: McpServer, { adminClient, adminAlphaClient
     },
     async ({ propertyId, request }) =>
       safeRun(async () => {
-        assertAllowedEntities(config, { product: "ga4", toolName: "ga4_run_report", ga4PropertyId: propertyId, request: { method: "POST", path: `/properties/${propertyId}:runReport` } });
+        await resolveGa4PropertyScope(adminClient, config, propertyId);
         return jsonResult(await dataClient.request({ method: "POST", path: `/properties/${propertyId}:runReport`, body: request }));
       })
   );
@@ -198,7 +200,7 @@ function registerGa4ReadTools(server: McpServer, { adminClient, adminAlphaClient
     },
     async ({ propertyId, request }) =>
       safeRun(async () => {
-        assertAllowedEntities(config, { product: "ga4", toolName: "ga4_batch_run_reports", ga4PropertyId: propertyId, request: { method: "POST", path: `/properties/${propertyId}:batchRunReports` } });
+        await resolveGa4PropertyScope(adminClient, config, propertyId);
         return jsonResult(await dataClient.request({ method: "POST", path: `/properties/${propertyId}:batchRunReports`, body: request }));
       })
   );
@@ -214,7 +216,7 @@ function registerGa4ReadTools(server: McpServer, { adminClient, adminAlphaClient
     },
     async ({ propertyId, request }) =>
       safeRun(async () => {
-        assertAllowedEntities(config, { product: "ga4", toolName: "ga4_run_realtime_report", ga4PropertyId: propertyId, request: { method: "POST", path: `/properties/${propertyId}:runRealtimeReport` } });
+        await resolveGa4PropertyScope(adminClient, config, propertyId);
         return jsonResult(await dataClient.request({ method: "POST", path: `/properties/${propertyId}:runRealtimeReport`, body: request }));
       })
   );
@@ -233,24 +235,28 @@ function registerGa4WriteTools(server: McpServer, { adminClient, adminAlphaClien
       })
     },
     async ({ propertyId, patch, updateMask, dryRun, confirm }) =>
-      runGuardedGoogleRequest({
-        client: adminClient,
-        config,
-        product: "ga4",
-        toolName: "ga4_patch_property",
-        ga4PropertyId: propertyId,
-        dryRun,
-        confirm,
-        request: {
-          method: "PATCH",
-          path: `/properties/${propertyId}`,
-          query: { updateMask },
-          body: patch
-        }
+      safeRun(async () => {
+        const { accountId } = await resolveGa4PropertyScope(adminClient, config, propertyId);
+        return runGuardedGoogleRequest({
+          client: adminClient,
+          config,
+          product: "ga4",
+          toolName: "ga4_patch_property",
+          ga4AccountId: accountId,
+          ga4PropertyId: propertyId,
+          dryRun,
+          confirm,
+          request: {
+            method: "PATCH",
+            path: `/properties/${propertyId}`,
+            query: { updateMask },
+            body: patch
+          }
+        });
       })
   );
 
-  registerPropertyCreatePatch(server, { adminClient, config }, {
+  registerPropertyCreatePatch(server, { client: adminClient, lookupClient: adminClient, config }, {
     createTool: "ga4_create_data_stream",
     patchTool: "ga4_patch_data_stream",
     resource: "dataStreams",
@@ -258,7 +264,7 @@ function registerGa4WriteTools(server: McpServer, { adminClient, adminAlphaClien
     idName: "dataStreamId"
   });
 
-  registerPropertyCreatePatch(server, { adminClient, config }, {
+  registerPropertyCreatePatch(server, { client: adminClient, lookupClient: adminClient, config }, {
     createTool: "ga4_create_custom_dimension",
     patchTool: "ga4_patch_custom_dimension",
     resource: "customDimensions",
@@ -266,7 +272,7 @@ function registerGa4WriteTools(server: McpServer, { adminClient, adminAlphaClien
     idName: "customDimensionId"
   });
 
-  registerPropertyCreatePatch(server, { adminClient, config }, {
+  registerPropertyCreatePatch(server, { client: adminClient, lookupClient: adminClient, config }, {
     createTool: "ga4_create_custom_metric",
     patchTool: "ga4_patch_custom_metric",
     resource: "customMetrics",
@@ -274,7 +280,7 @@ function registerGa4WriteTools(server: McpServer, { adminClient, adminAlphaClien
     idName: "customMetricId"
   });
 
-  registerPropertyCreatePatch(server, { adminClient, config }, {
+  registerPropertyCreatePatch(server, { client: adminClient, lookupClient: adminClient, config }, {
     createTool: "ga4_create_key_event",
     patchTool: "ga4_patch_key_event",
     resource: "keyEvents",
@@ -282,7 +288,7 @@ function registerGa4WriteTools(server: McpServer, { adminClient, adminAlphaClien
     idName: "keyEventId"
   });
 
-  registerPropertyCreatePatch(server, { adminClient, config }, {
+  registerPropertyCreatePatch(server, { client: adminClient, lookupClient: adminClient, config }, {
     createTool: "ga4_create_conversion_event",
     patchTool: "ga4_patch_conversion_event",
     resource: "conversionEvents",
@@ -291,7 +297,7 @@ function registerGa4WriteTools(server: McpServer, { adminClient, adminAlphaClien
     deprecatedAlternative: "Use GA4 key event tools for new integrations."
   });
 
-  registerPropertyCreatePatch(server, { adminClient: adminAlphaClient, config }, {
+  registerPropertyCreatePatch(server, { client: adminAlphaClient, lookupClient: adminClient, config }, {
     createTool: "ga4_create_audience",
     patchTool: "ga4_patch_audience",
     resource: "audiences",
@@ -310,19 +316,23 @@ function registerGa4WriteTools(server: McpServer, { adminClient, adminAlphaClien
       })
     },
     async ({ propertyId, customDimensionId, dryRun, confirm }) =>
-      runGuardedGoogleRequest({
-        client: adminClient,
-        config,
-        product: "ga4",
-        toolName: "ga4_archive_custom_dimension",
-        ga4PropertyId: propertyId,
-        dryRun,
-        confirm,
-        request: {
-          method: "POST",
-          path: `/properties/${propertyId}/customDimensions/${customDimensionId}:archive`,
-          body: {}
-        }
+      safeRun(async () => {
+        const { accountId } = await resolveGa4PropertyScope(adminClient, config, propertyId);
+        return runGuardedGoogleRequest({
+          client: adminClient,
+          config,
+          product: "ga4",
+          toolName: "ga4_archive_custom_dimension",
+          ga4AccountId: accountId,
+          ga4PropertyId: propertyId,
+          dryRun,
+          confirm,
+          request: {
+            method: "POST",
+            path: `/properties/${propertyId}/customDimensions/${customDimensionId}:archive`,
+            body: {}
+          }
+        });
       })
   );
 
@@ -337,19 +347,23 @@ function registerGa4WriteTools(server: McpServer, { adminClient, adminAlphaClien
       })
     },
     async ({ propertyId, customMetricId, dryRun, confirm }) =>
-      runGuardedGoogleRequest({
-        client: adminClient,
-        config,
-        product: "ga4",
-        toolName: "ga4_archive_custom_metric",
-        ga4PropertyId: propertyId,
-        dryRun,
-        confirm,
-        request: {
-          method: "POST",
-          path: `/properties/${propertyId}/customMetrics/${customMetricId}:archive`,
-          body: {}
-        }
+      safeRun(async () => {
+        const { accountId } = await resolveGa4PropertyScope(adminClient, config, propertyId);
+        return runGuardedGoogleRequest({
+          client: adminClient,
+          config,
+          product: "ga4",
+          toolName: "ga4_archive_custom_metric",
+          ga4AccountId: accountId,
+          ga4PropertyId: propertyId,
+          dryRun,
+          confirm,
+          request: {
+            method: "POST",
+            path: `/properties/${propertyId}/customMetrics/${customMetricId}:archive`,
+            body: {}
+          }
+        });
       })
   );
 }
@@ -413,9 +427,15 @@ function ga4PropertyFilter(
   return filter ?? `parent:accounts/${accountId}`;
 }
 
+interface PropertyToolContext {
+  client: GoogleApiClient;
+  lookupClient: GoogleApiClient;
+  config: ServerConfig;
+}
+
 function registerPropertyResource(
   server: McpServer,
-  { adminClient, config }: { adminClient: GoogleApiClient; config: ServerConfig },
+  { client, lookupClient, config }: PropertyToolContext,
   options: {
     listTool: string;
     getTool: string;
@@ -436,8 +456,8 @@ function registerPropertyResource(
     },
     async ({ propertyId, query }) =>
       safeRun(async () => {
-        assertAllowedEntities(config, { product: "ga4", toolName: options.listTool, ga4PropertyId: propertyId, request: { method: "GET", path: `/properties/${propertyId}/${options.resource}` } });
-        return jsonResult(await adminClient.request({ method: "GET", path: `/properties/${propertyId}/${options.resource}`, query }));
+        await resolveGa4PropertyScope(lookupClient, config, propertyId);
+        return jsonResult(await client.request({ method: "GET", path: `/properties/${propertyId}/${options.resource}`, query }));
       })
   );
 
@@ -455,8 +475,8 @@ function registerPropertyResource(
       const propertyId = input.propertyId;
       const resourceId = String(indexedInput[options.idName]);
       return safeRun(async () => {
-        assertAllowedEntities(config, { product: "ga4", toolName: options.getTool, ga4PropertyId: propertyId, request: { method: "GET", path: `/properties/${propertyId}/${options.resource}/${resourceId}` } });
-        return jsonResult(await adminClient.request({ method: "GET", path: `/properties/${propertyId}/${options.resource}/${resourceId}` }));
+        await resolveGa4PropertyScope(lookupClient, config, propertyId);
+        return jsonResult(await client.request({ method: "GET", path: `/properties/${propertyId}/${options.resource}/${resourceId}` }));
       });
     }
   );
@@ -464,7 +484,7 @@ function registerPropertyResource(
 
 function registerPropertyCreatePatch(
   server: McpServer,
-  { adminClient, config }: { adminClient: GoogleApiClient; config: ServerConfig },
+  { client, lookupClient, config }: PropertyToolContext,
   options: {
     createTool: string;
     patchTool: string;
@@ -485,19 +505,23 @@ function registerPropertyCreatePatch(
       })
     },
     async ({ propertyId, resource, dryRun, confirm }) =>
-      runGuardedGoogleRequest({
-        client: adminClient,
-        config,
-        product: "ga4",
-        toolName: options.createTool,
-        ga4PropertyId: propertyId,
-        dryRun,
-        confirm,
-        request: {
-          method: "POST",
-          path: `/properties/${propertyId}/${options.resource}`,
-          body: resource
-        }
+      safeRun(async () => {
+        const { accountId } = await resolveGa4PropertyScope(lookupClient, config, propertyId);
+        return runGuardedGoogleRequest({
+          client,
+          config,
+          product: "ga4",
+          toolName: options.createTool,
+          ga4AccountId: accountId,
+          ga4PropertyId: propertyId,
+          dryRun,
+          confirm,
+          request: {
+            method: "POST",
+            path: `/properties/${propertyId}/${options.resource}`,
+            body: resource
+          }
+        });
       })
   );
 
@@ -517,20 +541,24 @@ function registerPropertyCreatePatch(
       const indexedInput = input as Record<string, unknown> & typeof input;
       const propertyId = input.propertyId;
       const resourceId = String(indexedInput[options.idName]);
-      return runGuardedGoogleRequest({
-        client: adminClient,
-        config,
-        product: "ga4",
-        toolName: options.patchTool,
-        ga4PropertyId: propertyId,
-        dryRun: input.dryRun,
-        confirm: input.confirm,
-        request: {
-          method: "PATCH",
-          path: `/properties/${propertyId}/${options.resource}/${resourceId}`,
-          query: { updateMask: input.updateMask },
-          body: input.patch
-        }
+      return safeRun(async () => {
+        const { accountId } = await resolveGa4PropertyScope(lookupClient, config, propertyId);
+        return runGuardedGoogleRequest({
+          client,
+          config,
+          product: "ga4",
+          toolName: options.patchTool,
+          ga4AccountId: accountId,
+          ga4PropertyId: propertyId,
+          dryRun: input.dryRun,
+          confirm: input.confirm,
+          request: {
+            method: "PATCH",
+            path: `/properties/${propertyId}/${options.resource}/${resourceId}`,
+            query: { updateMask: input.updateMask },
+            body: input.patch
+          }
+        });
       });
     }
   );
@@ -538,4 +566,51 @@ function registerPropertyCreatePatch(
 
 function deprecatedGuidance(alternative: string | undefined): string {
   return alternative ? ` Deprecated Google API compatibility only. ${alternative}` : "";
+}
+
+interface Ga4PropertyScope {
+  accountId?: string;
+  property?: unknown;
+}
+
+// Property-scoped endpoints never name the account, so an account allowlist is checked against the
+// account Google reports for the property rather than anything the caller declares.
+async function resolveGa4PropertyScope(
+  lookupClient: GoogleApiClient,
+  config: ServerConfig,
+  propertyId: string
+): Promise<Ga4PropertyScope> {
+  assertEntityAllowed("GA4 property", propertyId, config.allowedGa4PropertyIds);
+
+  if (config.allowedGa4AccountIds.size === 0) {
+    return {};
+  }
+
+  const property = await lookupClient.request({ method: "GET", path: `/properties/${propertyId}` });
+  const accountId = ga4AccountIdOf(property);
+  if (!accountId) {
+    throw new SafetyError(
+      `GA4 property ${propertyId} did not expose its account, so GA4_ALLOWED_ACCOUNT_IDS could not be checked.`
+    );
+  }
+
+  assertEntityAllowed("GA4 account", accountId, config.allowedGa4AccountIds);
+  return { accountId, property };
+}
+
+function ga4AccountIdOf(property: unknown): string | undefined {
+  if (!property || typeof property !== "object" || Array.isArray(property)) {
+    return undefined;
+  }
+
+  const record = property as Record<string, unknown>;
+  for (const field of ["account", "parent"]) {
+    const value = record[field];
+    const match = typeof value === "string" ? /^accounts\/([^/]+)$/.exec(value) : null;
+    if (match) {
+      return match[1];
+    }
+  }
+
+  return undefined;
 }

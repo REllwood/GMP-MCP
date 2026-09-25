@@ -3,7 +3,7 @@ import path from "node:path";
 
 import { getAccessToken, type AccessTokenProvider } from "./auth.js";
 import type { ServerConfig } from "./config.js";
-import { readResponseBytes } from "./http.js";
+import { assertPathHasNoQuery, readResponseBytes, retryDelayMs } from "./http.js";
 
 export type HttpMethod = "GET" | "POST" | "PATCH" | "PUT" | "DELETE";
 
@@ -98,7 +98,7 @@ export class Cm360Client {
         );
       }
 
-      await sleep(backoffMs(attempt, response));
+      await sleep(retryDelayMs(attempt, response.headers.get("retry-after")));
     }
 
     throw new Error("CM360 API request exited retry loop unexpectedly.");
@@ -138,6 +138,7 @@ export class Cm360Client {
   }
 
   public buildUrl(requestPath: string, query: QueryParams = {}): URL {
+    assertPathHasNoQuery(requestPath);
     const normalisedPath = normaliseApiPath(requestPath);
     const base = this.config.apiBaseUrl.endsWith("/")
       ? this.config.apiBaseUrl.slice(0, -1)
@@ -230,18 +231,6 @@ async function safeReadResponseText(response: Response): Promise<string> {
   } catch {
     return "";
   }
-}
-
-function backoffMs(attempt: number, response: Response): number {
-  const retryAfter = response.headers.get("retry-after");
-  if (retryAfter) {
-    const seconds = Number(retryAfter);
-    if (Number.isFinite(seconds) && seconds > 0) {
-      return seconds * 1000;
-    }
-  }
-
-  return Math.min(30_000, 1000 * 2 ** attempt);
 }
 
 function sleep(ms: number): Promise<void> {

@@ -100,6 +100,8 @@ Example live-write instruction after review:
 Use the exact reviewed payload. Run dv360_create_line_item with dryRun=false and confirm=true.
 ```
 
+The preview guarantees that the live request is exactly the one that was previewed. It cannot prove that a person reviewed it: an assistant can call `dryRun=true` and then `confirm=true` in consecutive turns. Keep your MCP client's approval prompt switched on for write tools. Every tool publishes MCP annotations (`readOnlyHint`, `destructiveHint`) so clients can tell reads from writes.
+
 ## Write Flags
 
 Global write enablement:
@@ -171,13 +173,17 @@ Use raw request tools only when:
 
 When an allowlist is configured, the server extracts target IDs from the canonical raw request path and validates those IDs directly. Optional metadata must match the path but is never accepted as proof of scope. A raw endpoint that does not expose a configured allowlist target in its path is blocked; add a first-class tool with endpoint-aware validation instead.
 
+Pass query parameters in `query`. A raw path that contains `?` or `#` is rejected, because anything hidden there would reach Google without being checked.
+
 ## Audit Logs
 
-Dry runs, live write requests and live write completions are written to:
+Dry runs, live write requests and live write completions are written to `~/.gmp-mcp/audit.log` by default. Override it with:
 
 ```bash
-GMP_AUDIT_LOG_PATH=.gmp-mcp/audit.log
+GMP_AUDIT_LOG_PATH=/absolute/path/to/audit.log
 ```
+
+A relative path resolves against the server's working directory. Some MCP clients start servers from `/`, where nothing is writable, so prefer an absolute path.
 
 Each line is JSON. It includes:
 
@@ -221,9 +227,28 @@ How to use allowlists:
 - Use Google product permissions as the real access boundary.
 - Use MCP allowlists as a second check against mistakes.
 
+How targets are checked:
+
+A tool never accepts an ID supplied by the caller as proof of scope when Google can say who owns the target. Where the target's parent is not in the request path, the server looks it up first:
+
+- `GA4_ALLOWED_ACCOUNT_IDS`: property-scoped tools read the property's account from the Admin API.
+- `DV360_ALLOWED_PARTNER_IDS`: advertiser-scoped tools read the advertiser's partner. `dv360_list_advertisers` requires a `query.partnerId` from the allowlist.
+- `DV360_ALLOWED_CAMPAIGN_IDS` and `DV360_ALLOWED_INSERTION_ORDER_IDS`: insertion order and line item tools read the owning campaign and insertion order. Bulk line item tools check every line item, up to 20 per request, so split larger changes into batches.
+- `SA360_ALLOWED_CUSTOMER_IDS`: every conversion in `sa360_insert_conversions` or `sa360_update_conversions` must set `customerId`.
+
+Each lookup is an extra GET request, which counts towards the product's quota and `GMP_REQUESTS_PER_SECOND`. IDs that are checked must be passed under their exact names: `query.partner_id` in place of `query.partnerId`, for example, is rejected.
+
+Declared IDs must match the real target even without an allowlist. In particular, every SA360 conversion that sets `customerId` must use the tool's `customerId`, so the audit log records the right customer.
+
+What allowlists do not cover:
+
+- An allowlist restricts its own level and everything beneath it, not the levels above. With only `DV360_ALLOWED_INSERTION_ORDER_IDS` set, campaigns and advertiser-level targeting (which line items inherit) can still be changed. Pair child allowlists with a parent allowlist such as `DV360_ALLOWED_ADVERTISER_IDS`.
+- Bid Manager queries are not limited by DV360 partner or advertiser allowlists, because a query can report on any advertiser the credential can see. Use `BID_MANAGER_ALLOWED_QUERY_IDS` to limit them.
+- Duplicating a line item creates a new one, so, like creating one, it is blocked while `DV360_ALLOWED_LINE_ITEM_IDS` is set.
+
 Broad list behaviour:
 
-When a more specific allowlist is configured, broad list tools that cannot constrain the Google API request to those exact child IDs are blocked. Use a get tool for a known allowed ID, or temporarily remove the allowlist during a controlled discovery step.
+When a more specific allowlist is configured, broad list tools that cannot constrain the Google API request to those exact child IDs are blocked. DV360 insertion order and line item lists are also blocked while a campaign or insertion order allowlist is set. Use a get tool for a known allowed ID, or temporarily remove the allowlist during a controlled discovery step.
 
 CM360 note:
 
@@ -429,6 +454,14 @@ GMP_OAUTH_REFRESH_TOKEN=
 
 `GMP_SCOPES` is optional. Leave it unset to use the default scope set for all supported products, or set a space- or comma-separated list to run a narrower product deployment.
 
+### Products
+
+```bash
+GMP_PRODUCTS=
+```
+
+Leave `GMP_PRODUCTS` unset to register every product's tools. All 148 tool definitions are loaded into the assistant's context, roughly 34k tokens. To register only what you use, set a comma- or space-separated list of `cm360`, `dv360`, `bidmanager`, `ga4`, `gtm` and `sa360`, for example `GMP_PRODUCTS=ga4,gtm`. Unknown names stop the server at startup.
+
 ### API Base URLs
 
 These usually do not need to change.
@@ -456,24 +489,24 @@ GMP_MAX_RETRIES=3
 GMP_REQUEST_TIMEOUT_MS=60000
 ```
 
-The default rate is conservative. GMP APIs have different quotas and enforcement behaviour, and assistants can accidentally generate bursts if not constrained.
+The default rate is conservative. GMP APIs have different quotas and enforcement behaviour, and assistants can accidentally generate bursts if not constrained. Waits between retries, including those requested by a `Retry-After` header, are capped at 30 seconds.
 
 Increase cautiously only after checking the product quota and observing real usage.
 
 ### Downloads
 
 ```bash
-GMP_DOWNLOAD_DIR=.gmp-mcp/downloads
+GMP_DOWNLOAD_DIR=
 GMP_MAX_DOWNLOAD_BYTES=100000000
 ```
 
-Report downloads are written here. The tool response includes:
+Report downloads are written to `~/.gmp-mcp/downloads` unless `GMP_DOWNLOAD_DIR` is set. The tool response includes:
 
 - File path.
 - Size in bytes.
 - A small preview.
 
-Report URL downloads are restricted to trusted Google download hosts and HTTPS. Large downloads are blocked when they exceed `GMP_MAX_DOWNLOAD_BYTES`.
+`bidmanager_download_report` takes a query ID and report ID and reads the file's location from the report's own metadata. That location must be an HTTPS `storage.googleapis.com` URL. It is a signed URL, so it is fetched without your OAuth token. Large downloads are blocked when they exceed `GMP_MAX_DOWNLOAD_BYTES`.
 
 ## First Run Checklist
 
@@ -487,10 +520,10 @@ Use this checklist before enabling live writes:
 6. Add the server to an MCP client.
 7. Test read calls only.
 8. Add one low-risk allowlist entry.
-9. Run one write tool with `dryRun=true`.
-10. Inspect `.gmp-mcp/audit.log`.
-11. Confirm the dry-run payload is correct.
-12. Enable the product-specific write flag.
+9. Enable the product-specific write flag and restart the MCP server. Flags are read at startup, and a restart discards any earlier previews, so do this before the dry run.
+10. Run one write tool with `dryRun=true`. A dry run never sends the change to Google, even with writes enabled. With allowlists set, it may make read-only lookups to check who owns the target.
+11. Inspect `~/.gmp-mcp/audit.log`.
+12. Confirm the dry-run payload is correct.
 13. Within 15 minutes, run the exact same request with `dryRun=false` and `confirm=true`.
 14. Inspect the product UI and product audit logs.
 15. Disable writes again when live write access is no longer needed.
@@ -601,12 +634,12 @@ Recommended report flow:
 4. `bidmanager_run_query`
 5. `bidmanager_list_reports`
 6. `bidmanager_get_report`
-7. `bidmanager_download_report_url`
+7. `bidmanager_download_report`
 
 Bid Manager tool groups:
 
 - Queries: `bidmanager_list_queries`, `bidmanager_get_query`, `bidmanager_create_query`, `bidmanager_run_query`
-- Reports: `bidmanager_list_reports`, `bidmanager_get_report`, `bidmanager_download_report_url`
+- Reports: `bidmanager_list_reports`, `bidmanager_get_report`, `bidmanager_download_report`
 - Advanced: `bidmanager_api_request`
 
 ### GA4 / Analytics 360
@@ -793,8 +826,8 @@ Prefer adding a first-class tool before relying on raw requests for repeated wor
 Check:
 
 - The report has finished generating.
-- The report URL or file ID is correct.
-- `GMP_DOWNLOAD_DIR` is writable.
+- The query and report IDs, or the CM360 file ID, are correct.
+- The download directory (`~/.gmp-mcp/downloads` or `GMP_DOWNLOAD_DIR`) is writable.
 - The authenticated identity has access to the report.
 
 ### GTM publish fails
@@ -853,6 +886,7 @@ npm run start
 Important files:
 
 - `src/index.ts`: server entrypoint and product client wiring.
+- `src/annotations.ts`: MCP read-only and destructive hints for every tool.
 - `src/config.ts`: environment config, scopes, base URLs and allowlists.
 - `src/safety.ts`: dry-run, confirmation, write flags, allowlists and audit logging.
 - `src/googleApiClient.ts`: shared Google REST client.
